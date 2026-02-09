@@ -6,7 +6,7 @@ UP_SCRIPT="/etc/wireguard/up.sh"
 CLIENT_DIR="/root/wg_clients"
 SSH_CONF="/etc/ssh/sshd_config"
 
-# Динамическое определение текущих портов [cite: 4, 26]
+# Динамическое определение текущих портов [cite: 2, 26]
 SSH_PORT=$(grep "^Port " $SSH_CONF | awk '{print $2}'); SSH_PORT=${SSH_PORT:-10022}
 WG_PORT=$(grep "ListenPort" $WG_CONF 2>/dev/null | awk '{print $3}'); WG_PORT=${WG_PORT:-51820}
 
@@ -119,7 +119,7 @@ manage_security() {
     read -p "Enter..." temp
 }
 
-# --- ПРИМЕНЕНИЕ ЛИМИТОВ (Учитываем exit 0)  ---
+# --- ПРИМЕНЕНИЕ ЛИМИТОВ (Учитываем exit 0) [cite: 22-23] ---
 apply_mirror_limit() {
     local NAME=$1; local IP=$2; local SPEED=$3
     local ID_CLASS=$(echo $IP | cut -d. -f4)
@@ -182,10 +182,12 @@ full_setup() {
     sed -i "/^Port /d" $SSH_CONF && echo "Port $SSH_PORT" >> $SSH_CONF
     systemctl restart ssh
 
-    # --- ДОБАВЛЕНИЕ ALIAS ПРЯМО ПРИ УСТАНОВКЕ ---
+    # --- ИСПРАВЛЕННЫЙ ALIAS (v.13.48) ---
+    # Скрипт сам определяет свое имя (setupvps.sh) и полный путь
+    REAL_PATH=$(realpath "$0")
     if ! grep -q "alias vps=" ~/.bashrc; then
-        echo "alias vps='sudo /root/setup.sh'" >> ~/.bashrc
-        source ~/.bashrc 2>/dev/null
+        echo "alias vps='sudo $REAL_PATH'" >> ~/.bashrc
+        echo -e "\e[1;32m✅ Команда 'vps' успешно настроена!\e[0m"
     fi
 
     SERVER_IP="${WG_BASE}.1"; ROUTER_IP="${WG_BASE}.2"; IPHONE_IP="${WG_BASE}.3"
@@ -230,14 +232,14 @@ EOF
     generate_peer_config "Router" "$ROUTER_IP" "$USER_DNS" "$SERVER_PUB" "true" "$USER_LAN"
     generate_peer_config "iPhone" "$IPHONE_IP" "$USER_DNS" "$SERVER_PUB" "false" ""
     systemctl enable wg-quick@wg0 && systemctl restart wg-quick@wg0
-    echo -e "✅ Установка завершена!"
+    echo -e "✅ Установка завершена! Чтобы активировать команду 'vps', введите: source ~/.bashrc"
     read -p "Enter..." temp
 }
 
 # --- ГЛАВНОЕ МЕНЮ [cite: 47-58] ---
 while true; do
     clear; show_infra
-    echo "=== 🛡️ VPS MANAGER v.13.46 (Auto-Alias) ==="
+    echo "=== 🛡️ VPS MANAGER v.13.48 (Smart Alias) ==="
     echo -e "1) ПОЛНАЯ УСТАНОВКА\n2) 🔐 БЕЗОПАСНОСТЬ (SSH/Порты)\n3) ДОБАВИТЬ ПОРТ\n4) УДАЛИТЬ ПОРТ\n5) ДОБАВИТЬ ЮЗЕРА (QR)\n6) УДАЛИТЬ ЮЗЕРА\n7) ИЗМЕНИТЬ ЛИМИТ\n0) ВЫХОД"
     read -p "Действие: " M
     case $M in
