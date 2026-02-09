@@ -1,3 +1,4 @@
+
 #!/bin/bash
 
 # Константы путей и портов
@@ -6,7 +7,8 @@ UP_SCRIPT="/etc/wireguard/up.sh"
 CLIENT_DIR="/root/wg_clients"
 SSH_CONF="/etc/ssh/sshd_config"
 
-# Динамическое определение портов
+# ГЛОБАЛЬНОЕ ОПРЕДЕЛЕНИЕ ИНТЕРФЕЙСА И ПОРТОВ (Решает проблему падения WG)
+REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
 SSH_PORT=$(grep "^Port " $SSH_CONF | awk '{print $2}'); SSH_PORT=${SSH_PORT:-10022}
 WG_PORT=$(grep "ListenPort" $WG_CONF 2>/dev/null | awk '{print $3}'); WG_PORT=${WG_PORT:-51820}
 
@@ -59,7 +61,7 @@ show_infra() {
         echo -e "  [Port] \e[1;32m$p\e[0m --> \e[1;33mRouter:$p\e[0m"
     done
     echo -e "\e[1;31mАКТИВНЫЕ ЛИМИТЫ ЮЗЕРОВ:\e[0m"
-    grep -a "rate" $UP_SCRIPT 2>/dev/null | grep -a "dev wg0" | grep -a "# Client:" | sed 's/.*rate //; s/ceil.*# / --> /' | while read -r line; do
+    grep -a "rate" $UP_SCRIPT 2>/dev/null | grep -a "dev wg0" | grep -a "# Client:" | sed 's/.*rate //; s/ceil.*# / --> /; s/ || true//' | while read -r line; do
         echo -e "  [Speed] \e[1;36m$line\e[0m"
     done
     echo -e "-------------------------------------------\n"
@@ -127,7 +129,6 @@ apply_mirror_limit() {
 # --- ПОЛНАЯ УСТАНОВКА (СО ВСЕМИ СПИСКАМИ И ПОДПИСЯМИ) ---
 full_setup() {
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
     clear
     echo "=== 🛠 ПОЛНАЯ УСТАНОВКА СИСТЕМЫ ==="
 
@@ -232,7 +233,7 @@ EOF
 # --- ГЛАВНОЕ МЕНЮ ---
 while true; do
     clear; show_infra
-    echo "=== 🛡️ VPS MANAGER v.13.54 (Instant Launch) ==="
+    echo "=== 🛡️ VPS MANAGER v.13.56 (Iron Fix) ==="
     echo -e "1) ПОЛНАЯ УСТАНОВКА\n2) 🔐 БЕЗОПАСНОСТЬ (SSH/Порты)\n3) ДОБАВИТЬ ПОРТ\n4) УДАЛИТЬ ПОРТ\n5) ДОБАВИТЬ ЮЗЕРА (QR)\n6) УДАЛИТЬ ЮЗЕРА\n7) ИЗМЕНИТЬ ЛИМИТ\n0) ВЫХОД"
     read -p "Действие: " M
     case $M in
@@ -268,4 +269,3 @@ while true; do
         0) exit 0 ;;
     esac
 done
-
