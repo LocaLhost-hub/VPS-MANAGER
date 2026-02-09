@@ -1,3 +1,4 @@
+
 #!/bin/bash
 
 # Константы путей и портов
@@ -7,7 +8,6 @@ CLIENT_DIR="/root/wg_clients"
 SSH_CONF="/etc/ssh/sshd_config"
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (Чтобы меню не ломались) ---
-# Определяем интерфейс и порты сразу, чтобы они были доступны во всех подменю
 REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
 SSH_PORT=$(grep "^Port " $SSH_CONF | awk '{print $2}'); SSH_PORT=${SSH_PORT:-10022}
 WG_PORT=$(grep "ListenPort" $WG_CONF 2>/dev/null | awk '{print $3}'); WG_PORT=${WG_PORT:-51820}
@@ -175,11 +175,8 @@ full_setup() {
     sed -i "/^Port /d" $SSH_CONF && echo "Port $SSH_PORT" >> $SSH_CONF
     systemctl restart ssh
 
-    # --- МГНОВЕННАЯ АКТИВАЦИЯ КОМАНДЫ VPS (БЕЗ SOURCE) ---
     cp "$0" /usr/local/bin/vps
     chmod +x /usr/local/bin/vps
-    
-    # Резервный Alias в bashrc
     if ! grep -q "alias vps=" ~/.bashrc; then
         echo "alias vps='sudo /usr/local/bin/vps'" >> ~/.bashrc
     fi
@@ -223,8 +220,8 @@ PrivateKey = $SERVER_PRIV
 PostUp = $UP_SCRIPT
 PostDown = iptables -t nat -F; iptables -P FORWARD ACCEPT; ip link delete ifb0 2>/dev/null
 EOF
-    generate_peer_config "Router" "$ROUTER_IP" "$USER_DNS" "$SERVER_PUB" "true" "$USER_LAN"
-    generate_peer_config "iPhone" "$IPHONE_IP" "$USER_DNS" "$SERVER_PUB" "false" ""
+    generate_peer_config "Router" "$ROUTER_IP" "9.9.9.9" "$SERVER_PUB" "true" "$USER_LAN"
+    generate_peer_config "iPhone" "$IPHONE_IP" "9.9.9.9" "$SERVER_PUB" "false" ""
     systemctl enable wg-quick@wg0 && systemctl restart wg-quick@wg0
     echo -e "✅ Установка завершена! Команда 'vps' готова к работе."
     read -p "Enter..." temp
@@ -233,7 +230,7 @@ EOF
 # --- ГЛАВНОЕ МЕНЮ ---
 while true; do
     clear; show_infra
-    echo "=== 🛡️ VPS MANAGER v.13.56 (Instant Launch) ==="
+    echo "=== 🛡️ VPS MANAGER v.13.57 (Fix Deletion) ==="
     echo -e "1) ПОЛНАЯ УСТАНОВКА\n2) 🔐 БЕЗОПАСНОСТЬ (SSH/Порты)\n3) ДОБАВИТЬ ПОРТ\n4) УДАЛИТЬ ПОРТ\n5) ДОБАВИТЬ ЮЗЕРА (QR)\n6) УДАЛИТЬ ЮЗЕРА\n7) ИЗМЕНИТЬ ЛИМИТ\n0) ВЫХОД"
     read -p "Действие: " M
     case $M in
@@ -250,7 +247,8 @@ while true; do
         4) read -p "Порт для удаления: " D_PORT; [ -z "$D_PORT" ] && continue
            sed -i "/# Port:$D_PORT$/d" $UP_SCRIPT && ufw delete allow "$D_PORT" && systemctl restart wg-quick@wg0 ;;
         5) read -p "Имя: " NAME; [ -z "$NAME" ] && continue
-           read -p "Лимит (Мбит): " SPEED
+           read -p "Лимит (Мбит) [0 - безлимит]: " SPEED
+           SPEED=${SPEED:-0} # Если пусто, ставим 0
            BASE=$(grep -a "Address" $WG_CONF | head -1 | awk '{print $3}' | cut -d. -f1-3)
            LAST=$(grep -a "AllowedIPs" $WG_CONF | tail -1 | awk '{print $3}' | cut -d. -f4 | cut -d/ -f1)
            NEW_IP="${BASE}.$((LAST + 1))"; S_PUB=$(grep -a "PrivateKey" $WG_CONF | awk '{print $3}' | wg pubkey)
@@ -260,11 +258,14 @@ while true; do
            qrencode -t ansiutf8 < $CLIENT_DIR/$NAME.conf && read -p "Done. Enter..." temp ;;
         6) grep -a "# Client:" $WG_CONF | awk '{print $3}'
            read -p "Имя для удаления: " D_NAME; [ -z "$D_NAME" ] && continue
-           sed -i "/# Client: $D_NAME/,+3d" $WG_CONF && sed -i "/# Client:$D_NAME/d" $UP_SCRIPT && rm -f $CLIENT_DIR/$D_NAME.conf && systemctl restart wg-quick@wg0 ;;
+           # ИСПРАВЛЕННОЕ УДАЛЕНИЕ: вырезаем блок [Peer] целиком
+           sed -i "/^\[Peer\]$/{N;/# Client: $D_NAME/{N;N;d}}" $WG_CONF
+           sed -i "/# Client:$D_NAME/d" $UP_SCRIPT && rm -f $CLIENT_DIR/$D_NAME.conf && systemctl restart wg-quick@wg0 ;;
         7) grep -a "# Client:" $WG_CONF | awk '{print $3}'
            read -p "Имя: " C_NAME; [ -z "$C_NAME" ] && continue
            C_IP=$(grep -a -A 2 "# Client: $C_NAME" $WG_CONF | grep "AllowedIPs" | awk '{print $3}' | cut -d/ -f1)
-           read -p "Новый лимит: " NEW_S; sed -i "/# Client:$C_NAME/d" $UP_SCRIPT
+           read -p "Новый лимит (Мбит) [0 - безлимит]: " NEW_S; NEW_S=${NEW_S:-0}
+           sed -i "/# Client:$C_NAME/d" $UP_SCRIPT
            [ "$NEW_S" -ne 0 ] && apply_mirror_limit "$C_NAME" "$C_IP" "$NEW_S" && systemctl restart wg-quick@wg0 ;;
         0) exit 0 ;;
     esac
