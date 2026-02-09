@@ -1,23 +1,24 @@
+
 #!/bin/bash
 
-# Константы путей и портов [cite: 1]
+# Константы путей и портов
 WG_CONF="/etc/wireguard/wg0.conf"
 UP_SCRIPT="/etc/wireguard/up.sh"
 CLIENT_DIR="/root/wg_clients"
 SSH_CONF="/etc/ssh/sshd_config"
 
-# Динамическое определение текущих портов [cite: 2, 26]
+# Динамическое определение текущих портов 
 SSH_PORT=$(grep "^Port " $SSH_CONF | awk '{print $2}'); SSH_PORT=${SSH_PORT:-10022}
 WG_PORT=$(grep "ListenPort" $WG_CONF 2>/dev/null | awk '{print $3}'); WG_PORT=${WG_PORT:-51820}
 
-# Проверка прав root [cite: 2-3]
+# Проверка прав root 
 [ "$EUID" -ne 0 ] && echo "Запустите через sudo!" && exit 1
 
 # Определяем IP сервера
 echo "Определяем IP сервера..."
 CACHED_IP=$(curl -4 -s --connect-timeout 2 ifconfig.me)
 
-# --- ГЛОБАЛЬНАЯ ФУНКЦИЯ СОЗДАНИЯ КОНФИГА (С QR и подписями) [cite: 3-5] ---
+# --- ГЛОБАЛЬНАЯ ФУНКЦИЯ СОЗДАНИЯ КОНФИГА (С QR и подписями)  ---
 generate_peer_config() {
     local NAME=$1; local IP=$2; local DNS_SRV=$3; local PUB_K=$4; local IS_ROUTER=$5; local USER_LAN=$6
     local CP=$(wg genkey); local CB=$(echo "$CP" | wg pubkey)
@@ -36,9 +37,8 @@ PersistentKeepalive = 25
 EOF
 }
 
-# --- ФУНКЦИЯ ВИЗУАЛИЗАЦИИ ИНФРАСТРУКТУРЫ (СО СТАТУСОМ ПАРОЛЯ) [cite: 5-10] ---
+# --- ФУНКЦИЯ ВИЗУАЛИЗАЦИИ ИНФРАСТРУКТУРЫ (СО СТАТУСОМ ПАРОЛЯ)  ---
 show_infra() {
-    # Статус пароля SSH для главного меню
     PASS_AUTH=$(grep "^PasswordAuthentication" $SSH_CONF | awk '{print $2}')
     [ "$PASS_AUTH" == "yes" ] && SSH_STATUS="\e[1;31mВКЛЮЧЕН (⚠️ НЕБЕЗОПАСНО!)\e[0m" || SSH_STATUS="\e[1;32mОТКЛЮЧЕН (ТОЛЬКО КЛЮЧИ)\e[0m"
 
@@ -66,7 +66,7 @@ show_infra() {
     echo -e "-------------------------------------------\n"
 }
 
-# --- УПРАВЛЕНИЕ БЕЗОПАСНОСТЬЮ (SSH + WG) [cite: 11-21] ---
+# --- УПРАВЛЕНИЕ БЕЗОПАСНОСТЬЮ (SSH + WG)  ---
 manage_security() {
     clear
     echo -e "=== 🔐 ЦЕНТР БЕЗОПАСНОСТИ ==="
@@ -77,8 +77,7 @@ manage_security() {
     read -p "Выбор: " S_OPT
 
     case $S_OPT in
-        1) # Переключение PasswordAuthentication [cite: 12-14]
-           echo -e "\n1) ВКЛЮЧИТЬ\n2) ОТКЛЮЧИТЬ"
+        1) echo -e "\n1) ВКЛЮЧИТЬ\n2) ОТКЛЮЧИТЬ"
            read -p "Выбор: " P_VAL
            EXTRA_CONFS="/etc/ssh/sshd_config.d/*.conf"
            if [ "${P_VAL:-1}" == "2" ]; then
@@ -92,9 +91,7 @@ manage_security() {
                echo "✅ Пароли включены."
            fi
            systemctl restart ssh ;;
-        
-        2) # Смена SSH порта [cite: 15-17]
-           read -p "Новый SSH порт: " NEW_SSH
+        2) read -p "Новый SSH порт: " NEW_SSH
            if [[ "$NEW_SSH" =~ ^[0-9]+$ ]]; then
                ufw delete allow "$SSH_PORT/tcp"
                ufw allow "$NEW_SSH/tcp"
@@ -103,9 +100,7 @@ manage_security() {
                systemctl restart ssh
                echo "✅ SSH теперь на порту $NEW_SSH."
            fi ;;
-
-        3) # Смена порта WireGuard [cite: 18-21]
-           read -p "Новый WG порт: " NEW_WG
+        3) read -p "Новый WG порт: " NEW_WG
            if [[ "$NEW_WG" =~ ^[0-9]+$ ]]; then
                ufw delete allow "$WG_PORT/udp"
                ufw allow "$NEW_WG/udp"
@@ -119,11 +114,10 @@ manage_security() {
     read -p "Enter..." temp
 }
 
-# --- ПРИМЕНЕНИЕ ЛИМИТОВ (Учитываем exit 0) [cite: 22-23] ---
+# --- ПРИМЕНЕНИЕ ЛИМИТОВ (Учитываем exit 0)  ---
 apply_mirror_limit() {
     local NAME=$1; local IP=$2; local SPEED=$3
     local ID_CLASS=$(echo $IP | cut -d. -f4)
-    # Удаляем exit 0 перед записью новых команд
     sed -i '/^exit 0/d' $UP_SCRIPT
     echo "tc class add dev wg0 parent 1:1 classid 1:$ID_CLASS htb rate ${SPEED}mbit ceil ${SPEED}mbit # Client:$NAME || true" >> $UP_SCRIPT
     echo "tc filter add dev wg0 protocol ip parent 1:0 prio 1 u32 match ip dst $IP flowid 1:$ID_CLASS # Client:$NAME || true" >> $UP_SCRIPT
@@ -132,7 +126,7 @@ apply_mirror_limit() {
     echo "exit 0" >> $UP_SCRIPT
 }
 
-# --- ПОЛНАЯ УСТАНОВКА (СО ВСЕМИ СПИСКАМИ) [cite: 24-46] ---
+# --- ПОЛНАЯ УСТАНОВКА (С ПОДПИСЯМИ ПОДСЕТЕЙ)  ---
 full_setup() {
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
@@ -166,7 +160,12 @@ full_setup() {
     esac
 
     echo -e "\n--- 3. Выберите домашнюю подсеть ---"
-    echo -e "1) 192.168.1.0/24\n2) 192.168.0.0/24\n3) 192.168.31.0/24\n4) 192.168.88.0/24\n5) 10.0.1.0/24\n6) Вручную"
+    echo -e "1) 192.168.1.0/24  (Keenetic / ASUS / TP-Link)"
+    echo -e "2) 192.168.0.0/24  (D-Link / TP-Link)"
+    echo -e "3) 192.168.31.0/24 (Xiaomi)"
+    echo -e "4) 192.168.88.0/24 (MikroTik)"
+    echo -e "5) 10.0.1.0/24     (Apple / Custom)"
+    echo -e "6) Вручную"
     read -p "Выбор [1]: " LAN_CHOICE
     case ${LAN_CHOICE:-1} in
         2) USER_LAN="192.168.0.0/24" ;; 3) USER_LAN="192.168.31.0/24" ;; 4) USER_LAN="192.168.88.0/24" ;;
@@ -182,12 +181,10 @@ full_setup() {
     sed -i "/^Port /d" $SSH_CONF && echo "Port $SSH_PORT" >> $SSH_CONF
     systemctl restart ssh
 
-    # --- ИСПРАВЛЕННЫЙ ALIAS (v.13.48) ---
-    # Скрипт сам определяет свое имя (setupvps.sh) и полный путь
+    # --- ИСПРАВЛЕННЫЙ ALIAS (Smart Alias v.13.50)  ---
     REAL_PATH=$(realpath "$0")
     if ! grep -q "alias vps=" ~/.bashrc; then
         echo "alias vps='sudo $REAL_PATH'" >> ~/.bashrc
-        echo -e "\e[1;32m✅ Команда 'vps' успешно настроена!\e[0m"
     fi
 
     SERVER_IP="${WG_BASE}.1"; ROUTER_IP="${WG_BASE}.2"; IPHONE_IP="${WG_BASE}.3"
@@ -232,14 +229,15 @@ EOF
     generate_peer_config "Router" "$ROUTER_IP" "$USER_DNS" "$SERVER_PUB" "true" "$USER_LAN"
     generate_peer_config "iPhone" "$IPHONE_IP" "$USER_DNS" "$SERVER_PUB" "false" ""
     systemctl enable wg-quick@wg0 && systemctl restart wg-quick@wg0
-    echo -e "✅ Установка завершена! Чтобы активировать команду 'vps', введите: source ~/.bashrc"
+    echo -e "✅ Установка завершена!"
+    echo -e "\e[1;33m⚠️ Чтобы команда 'vps' заработала прямо сейчас, введите: source ~/.bashrc\e[0m"
     read -p "Enter..." temp
 }
 
-# --- ГЛАВНОЕ МЕНЮ [cite: 47-58] ---
+# --- ГЛАВНОЕ МЕНЮ  ---
 while true; do
     clear; show_infra
-    echo "=== 🛡️ VPS MANAGER v.13.48 (Smart Alias) ==="
+    echo "=== 🛡️ VPS MANAGER v.13.50 (Full Labels) ==="
     echo -e "1) ПОЛНАЯ УСТАНОВКА\n2) 🔐 БЕЗОПАСНОСТЬ (SSH/Порты)\n3) ДОБАВИТЬ ПОРТ\n4) УДАЛИТЬ ПОРТ\n5) ДОБАВИТЬ ЮЗЕРА (QR)\n6) УДАЛИТЬ ЮЗЕРА\n7) ИЗМЕНИТЬ ЛИМИТ\n0) ВЫХОД"
     read -p "Действие: " M
     case $M in
