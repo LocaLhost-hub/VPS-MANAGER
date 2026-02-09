@@ -1,4 +1,3 @@
-
 #!/bin/bash
 
 # Константы путей и портов
@@ -7,7 +6,8 @@ UP_SCRIPT="/etc/wireguard/up.sh"
 CLIENT_DIR="/root/wg_clients"
 SSH_CONF="/etc/ssh/sshd_config"
 
-# ГЛОБАЛЬНОЕ ОПРЕДЕЛЕНИЕ ИНТЕРФЕЙСА И ПОРТОВ (Решает проблему падения WG)
+# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (Чтобы меню не ломались) ---
+# Определяем интерфейс и порты сразу, чтобы они были доступны во всех подменю
 REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
 SSH_PORT=$(grep "^Port " $SSH_CONF | awk '{print $2}'); SSH_PORT=${SSH_PORT:-10022}
 WG_PORT=$(grep "ListenPort" $WG_CONF 2>/dev/null | awk '{print $3}'); WG_PORT=${WG_PORT:-51820}
@@ -226,14 +226,14 @@ EOF
     generate_peer_config "Router" "$ROUTER_IP" "$USER_DNS" "$SERVER_PUB" "true" "$USER_LAN"
     generate_peer_config "iPhone" "$IPHONE_IP" "$USER_DNS" "$SERVER_PUB" "false" ""
     systemctl enable wg-quick@wg0 && systemctl restart wg-quick@wg0
-    echo -e "✅ Установка завершена! Команда 'vps' для вызова меню."
+    echo -e "✅ Установка завершена! Команда 'vps' готова к работе."
     read -p "Enter..." temp
 }
 
 # --- ГЛАВНОЕ МЕНЮ ---
 while true; do
     clear; show_infra
-    echo "=== 🛡️ VPS MANAGER v.13.56 (Iron Fix) ==="
+    echo "=== 🛡️ VPS MANAGER v.13.56 (Instant Launch) ==="
     echo -e "1) ПОЛНАЯ УСТАНОВКА\n2) 🔐 БЕЗОПАСНОСТЬ (SSH/Порты)\n3) ДОБАВИТЬ ПОРТ\n4) УДАЛИТЬ ПОРТ\n5) ДОБАВИТЬ ЮЗЕРА (QR)\n6) УДАЛИТЬ ЮЗЕРА\n7) ИЗМЕНИТЬ ЛИМИТ\n0) ВЫХОД"
     read -p "Действие: " M
     case $M in
