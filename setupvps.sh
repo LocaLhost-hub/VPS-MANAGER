@@ -225,7 +225,7 @@ EOF
     generate_peer_config "Router" "$ROUTER_IP" "$USER_DNS" "$SERVER_PUB" "true" "$USER_LAN"
     generate_peer_config "iPhone" "$IPHONE_IP" "$USER_DNS" "$SERVER_PUB" "false" ""
     systemctl enable wg-quick@wg0 && systemctl restart wg-quick@wg0
-    echo -e "✅ Установка завершена! Команда 'vps' теперь работает мгновенно."
+    echo -e "✅ Установка завершена! Команда 'vps' для вызова меню."
     read -p "Enter..." temp
 }
 
@@ -268,3 +268,4 @@ while true; do
         0) exit 0 ;;
     esac
 done
+
