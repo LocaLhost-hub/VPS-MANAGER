@@ -287,7 +287,7 @@ full_setup() {
         5) USER_LAN="10.0.1.0/24" ;; 6) read -p "Ввод: " USER_LAN ;; *) USER_LAN="192.168.1.0/24" ;;
     esac
 
-    read -p "4. Порты проброса  (через пробел 80 443 8090): " USER_PORTS
+    read -p "4. Порты проброса  (один порт обязательно): " USER_PORTS
     apt-get update -y && apt-get install -y ufw wireguard fail2ban qrencode curl jq iptables iproute2 ipset
     ufw --force reset
     ufw allow "$SSH_PORT/tcp" && ufw allow "$WG_PORT/udp"
