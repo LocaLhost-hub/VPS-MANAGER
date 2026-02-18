@@ -13,7 +13,7 @@
 Подключитесь к вашему VPS по SSH и выполните команду:
 
 ```bash
-wget -O bench.sh https://raw.githubusercontent.com/LocaLhost-hub/VPS-MANAGER/main/bench.sh && chmod +x bench.sh && ./bench.sh
+curl -sL https://raw.githubusercontent.com/LocaLhost-hub/VPS-MANAGER/main/bench.sh -o bench.sh && chmod +x bench.sh && sudo ./bench.sh
 
 ```
 
