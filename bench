@@ -178,7 +178,7 @@ manage_security() {
         echo "2) 🚀 Изменить SSH порт"
         echo "3) 🛰 Изменить WireGuard порт"
         echo "4) 🌍 Настроить GeoIP (Белый список стран)"
-        echo "5) 🛡 ОТКЛЮЧИТЬ Rate Limit"
+        echo "5) 🛡 ОТКЛЮЧИТЬ Anti-DDoS"
         echo "6) 🔓 ОТКЛЮЧИТЬ GeoIP фильтрацию"
         echo -e "7) \e[1;32m🔑 УПРАВЛЕНИЕ SSH КЛЮЧАМИ\e[0m"
         echo -e "8) 🔄 Автообновление GeoIP [ $CRON_ST ] | Last: \e[1;33m$LAST_UP\e[0m"
