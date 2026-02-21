@@ -472,10 +472,11 @@ EOF
     systemctl restart fail2ban
     # -------------------------------------------------------
     
-    if sshd -t; then
+   if sshd -t; then
         systemctl stop ssh.socket > /dev/null 2>&1
         systemctl disable ssh.socket > /dev/null 2>&1
         systemctl daemon-reload
+        systemctl enable ssh || systemctl enable sshd    
         systemctl restart ssh || systemctl restart sshd
     fi
 
