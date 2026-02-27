@@ -1259,7 +1259,7 @@ echo "SET"
 EOF
 chmod +x /root/scripts/set_limit.sh
 
-    # ADD PORT
+# ADD PORT
     cat <<'EOF' > /root/scripts/add_port.sh
 #!/bin/bash
 CLIENT_NAME=$1; PORT=$2
@@ -1267,13 +1267,17 @@ UP_SCRIPT="/etc/wireguard/up.sh"; WG_CONF="/etc/wireguard/wg0.conf"
 REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
 TARGET_IP=$(grep -A 3 "# Client: $CLIENT_NAME" "$WG_CONF" | grep AllowedIPs | awk '{print $3}' | cut -d/ -f1)
 [ -z "$TARGET_IP" ] && echo "ERROR" && exit 1
+
 if grep -q "dport $PORT " "$UP_SCRIPT"; then echo "BUSY"; exit 1; fi
+
 ufw allow "$PORT" >/dev/null 2>&1
 ufw route allow in on "$REAL_IF" out on wg0 to "$TARGET_IP" port "$PORT" >/dev/null 2>&1
+
 sed -i '/^exit 0/d' "$UP_SCRIPT"
-echo "iptables -t nat -A PREROUTING -p tcp --dport $PORT -j DNAT --to-destination $TARGET_IP:$PORT # Port:$PORT" >> "$UP_SCRIPT"
-echo "iptables -t nat -A PREROUTING -p udp --dport $PORT -j DNAT --to-destination $TARGET_IP:$PORT # Port:$PORT" >> "$UP_SCRIPT"
+echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $PORT -j DNAT --to-destination $TARGET_IP:$PORT # Port:$PORT" >> "$UP_SCRIPT"
+echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $PORT -j DNAT --to-destination $TARGET_IP:$PORT # Port:$PORT" >> "$UP_SCRIPT"
 echo "exit 0" >> "$UP_SCRIPT"
+
 systemctl restart wg-quick@wg0
 echo "SUCCESS"
 EOF
