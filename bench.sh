@@ -19,6 +19,7 @@ WG_CONF="/etc/wireguard/wg0.conf"
 UP_SCRIPT="/etc/wireguard/up.sh"
 CLIENT_DIR="/root/wg_clients"
 SSH_KEY_DIR="/etc/wireguard/ssh_key"
+REPO_URL="https://raw.githubusercontent.com/LocaLhost-hub/VPS-MANAGER/main/bench.sh"
 
 SSH_PORT=$(grep "^Port " "$SSH_CONF" 2>/dev/null | awk '{print $2}'); SSH_PORT=${SSH_PORT:-10022}
 WG_PORT=$(grep "ListenPort" "$WG_CONF" 2>/dev/null | awk '{print $3}'); WG_PORT=${WG_PORT:-51820}
@@ -61,6 +62,34 @@ if [ "$1" == "update_geoip" ]; then
     else
         ipset destroy whitelist_new 2>/dev/null
         echo "$(date '+%Y-%m-%d %H:%M'): Ошибка загрузки списков ($COUNTRIES)" >> "$LOG_FILE"
+    fi
+    exit 0
+fi
+
+# --- ОБРАБОТЧИК АВТОБЭКАПА В TELEGRAM (ДЛЯ CRON) ---
+if [ "$1" == "backup_tg" ]; then
+    BACKUP_DIR="/root/vps_backups"
+    mkdir -p "$BACKUP_DIR"
+    ARCHIVE="$BACKUP_DIR/vps_backup_$(date '+%Y-%m-%d_%H-%M-%S').tar.gz"
+    PATHS=()
+    [ -d /etc/wireguard ] && PATHS+=("/etc/wireguard")
+    [ -d /root/wg_clients ] && PATHS+=("/root/wg_clients")
+    [ -d /etc/ipset ] && PATHS+=("/etc/ipset")
+    [ -f /root/.tg_config ] && PATHS+=("/root/.tg_config")
+
+    if [ ${#PATHS[@]} -gt 0 ]; then
+        tar -czf "$ARCHIVE" "${PATHS[@]}" 2>/dev/null
+        if [ -f /root/.tg_config ]; then
+            source /root/.tg_config
+            if [ -n "$TOKEN" ] && [ -n "$ADMIN_ID" ]; then
+                HOST_IP=$(curl -4 -s --connect-timeout 3 eth0.me || hostname)
+                curl -s -F document=@"$ARCHIVE" \
+                     -F caption="💾 Автобэкап VPS ($HOST_IP) — $(date '+%Y-%m-%d %H:%M')" \
+                     "https://api.telegram.org/bot${TOKEN}/sendDocument?chat_id=${ADMIN_ID}" >/dev/null 2>&1
+            fi
+        fi
+        # Оставляем только последние 10 локальных архивов
+        ls -1t "$BACKUP_DIR"/vps_backup_*.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm -f
     fi
     exit 0
 fi
@@ -123,7 +152,7 @@ show_infra() {
     echo "    \ \/ / |  ___/ \___ \  | |\/| | / /\ \ | . \` | / /\ \| | |_ |  __| |  _  / "
     echo "     \  /  | |     ____) | | |  | |/ ____ \| |\  |/ ____ \ |__| | |____| | \ \ "
     echo "      \/   |_|    |_____/  |_|  |_/_/    \_\_| \_/_/    \_\_____|______|_|  \_\\"
-    echo -e "                          \e[1;34m🔥 СИСТЕМА УПРАВЛЕНИЯ VPS v3.1 🔥\e[0m"
+    echo -e "                          \e[1;34m🔥 СИСТЕМА УПРАВЛЕНИЯ VPS v3.2 🔥\e[0m"
 
     GW_IP=$(ip -4 route show default | awk '/default/ {print $3}')
     VPN_NET=$(grep "^Address" "$WG_CONF" 2>/dev/null | awk '{print $3}' | head -1)
@@ -132,6 +161,18 @@ show_infra() {
     CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
     CURRENT_WG_PORT=$(grep "ListenPort" "$WG_CONF" 2>/dev/null | awk '{print $3}')
     CURRENT_WG_PORT=${CURRENT_WG_PORT:-51820}
+
+    # Ресурсы сервера
+    LOAD_AVG=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    RAM_INFO=$(free -m 2>/dev/null | awk '/Mem:/ {printf "%d/%dMB", $3, $2}')
+    DISK_INFO=$(df -h / 2>/dev/null | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')
+
+    BBR_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$BBR_CC" == "bbr" ]; then
+        BBR_STATUS="\e[1;32mON\e[0m"
+    else
+        BBR_STATUS="\e[1;30mOFF\e[0m"
+    fi
 
     if grep -q "match-set whitelist" "$UP_SCRIPT" 2>/dev/null && [ -s /etc/ipset/whitelist.conf ]; then
         GEO_STATUS="\e[1;32mON (Вкл)\e[0m"
@@ -168,17 +209,23 @@ show_infra() {
     echo -e "\n\e[1;34m=== 📊 СВОДКА СЕРВЕРА ===\e[0m"
     printf " 📡 %-25s %-25s\n" "WAN: ${CACHED_IP:-...}" "GATEWAY: ${GW_IP:-ND}"
     printf " 🕸️ %-25s %-25s\n" "VPN: ${VPN_NET:-ND}"   "WG PORT: $CURRENT_WG_PORT"
-    printf " 🖥️ WEB: %-34b 🌍 GEOIP: %b\n" "$WEB_STATUS" "$GEO_STATUS"
+    printf " 🖥️ WEB: %-34b 🌍 GEOIP: %-20b ⚡ BBR: %b\n" "$WEB_STATUS" "$GEO_STATUS" "$BBR_STATUS"
     printf " 🛡️ SSH: %-34b PORT: %-10s 🌐 IP: %b\n" "$SSH_TXT" "$CURRENT_SSH_PORT" "$REALIP_STATUS"
+    printf " 💻 CPU: %-12s 🧠 RAM: %-16s 💾 DISK: %s\n" "${LOAD_AVG:-0}" "${RAM_INFO:-ND}" "${DISK_INFO:-ND}"
 
     declare -A map_ports
     if [ -f "$UP_SCRIPT" ]; then
         while read -r line; do
-            if [[ "$line" =~ --dport\ ([0-9]+).*--to-destination\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                 port="${BASH_REMATCH[1]}"
+            if [[ "$line" =~ --dport\ ([0-9]+).*--to-destination\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+) ]]; then
+                 ext_port="${BASH_REMATCH[1]}"
                  dest_ip="${BASH_REMATCH[2]}"
-                 if grep -q "dport $port.*hitcount" "$UP_SCRIPT"; then p_icon="🛡️"; else p_icon=""; fi
-                 entry="$port$p_icon"
+                 int_port="${BASH_REMATCH[3]}"
+                 if grep -q "dport $ext_port.*hitcount" "$UP_SCRIPT"; then p_icon="🛡️"; else p_icon=""; fi
+                 if [ "$ext_port" == "$int_port" ]; then
+                     entry="${ext_port}${p_icon}"
+                 else
+                     entry="${ext_port}:${int_port}${p_icon}"
+                 fi
                  if [ -z "${map_ports[$dest_ip]}" ]; then 
                     map_ports[$dest_ip]="$entry"
                  else 
@@ -209,8 +256,8 @@ show_infra() {
     fi
 
     echo -e "\n\e[1;34m=== 👥 СПИСОК КЛИЕНТОВ ===\e[0m"
-    printf "\e[1;33m %-2s %-13s  %-15s  %-18s  %-10s  %-8s\e[0m\n" "ST" "CLIENT" "IP" "PORTS" "LIMIT" "TRAFFIC"
-    echo " ---------------------------------------------------------------------------"
+    printf "\e[1;33m %-2s %-13s  %-15s  %-20s  %-10s  %-8s\e[0m\n" "ST" "CLIENT" "IP" "PORTS" "LIMIT" "TRAFFIC"
+    echo " -----------------------------------------------------------------------------"
 
     if [ -f "$WG_CONF" ]; then
         current_name=""
@@ -228,13 +275,13 @@ show_infra() {
 
                     [ -z "$limit" ] && speed_d="\e[1;35m♾️ Unlim\e[0m" || speed_d="\e[1;33m📉 ${limit}Mb\e[0m"
 
-                    printf " %s \e[1;37m%-13s\e[0m  %-15s  %-29b  %-19b  \e[1;36m%-8s\e[0m\n" "$st" "$current_name" "$ip" "$ports_d" "$speed_d" "$traf"
+                    printf " %s \e[1;37m%-13s\e[0m  %-15s  %-31b  %-19b  \e[1;36m%-8s\e[0m\n" "$st" "$current_name" "$ip" "$ports_d" "$speed_d" "$traf"
                     current_name=""
                 fi
             fi
         done < "$WG_CONF"
     fi
-    echo " ---------------------------------------------------------------------------"
+    echo " -----------------------------------------------------------------------------"
     echo ""
 }
 
@@ -455,7 +502,6 @@ EOF
                    echo "❌ Файл $UP_SCRIPT не найден! Сначала выполните установку."
                elif grep -qE "^iptables.*-A POSTROUTING.*-o wg0 -j MASQUERADE" "$UP_SCRIPT"; then
                    sed -i '/-o wg0 -j MASQUERADE/d' "$UP_SCRIPT"
-                   # Удаляем правило на лету без рестарта wg0
                    while iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null; do :; done
                    VPN_SUB=$(grep "^Address" "$WG_CONF" 2>/dev/null | awk '{print $3}' | head -1 | sed 's/\.[0-9]*\//.0\//')
                    [ -n "$VPN_SUB" ] && while iptables -t nat -D POSTROUTING -d "$VPN_SUB" -o wg0 -j MASQUERADE 2>/dev/null; do :; done
@@ -541,7 +587,7 @@ full_setup() {
     esac
 
     echo -e "\n--- 3. Проброс портов ---"
-    read -p "Введите порты через пробел (например, 80 443) или Enter для пропуска: " USER_PORTS
+    read -p "Введите порты (напр: 80 443 8443:443) или Enter для пропуска: " USER_PORTS
 
     echo -e "\n📦 Установка необходимых компонентов..."
     apt-get update -y && apt-get install -y ufw wireguard fail2ban qrencode curl jq iptables iproute2 ipset
@@ -626,12 +672,19 @@ tc class add dev ifb0 parent 1:1 classid 1:10 htb rate 1000mbit ceil 1000mbit pr
 EOF
 
     if [ -n "$USER_PORTS" ]; then
-        for port in $USER_PORTS; do
-            ufw allow "$port"
-            echo "iptables -t nat -D PREROUTING -i $REAL_IF -p tcp --dport $port -j DNAT --to-destination $ROUTER_IP:$port 2>/dev/null || true" >> "$UP_SCRIPT"
-            echo "iptables -t nat -D PREROUTING -i $REAL_IF -p udp --dport $port -j DNAT --to-destination $ROUTER_IP:$port 2>/dev/null || true" >> "$UP_SCRIPT"
-            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $port -j DNAT --to-destination $ROUTER_IP:$port # Port:$port" >> "$UP_SCRIPT"
-            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $port -j DNAT --to-destination $ROUTER_IP:$port # Port:$port" >> "$UP_SCRIPT"
+        for raw_p in $USER_PORTS; do
+            if [[ "$raw_p" == *:* ]]; then
+                ext_p="${raw_p%%:*}"
+                int_p="${raw_p##*:}"
+            else
+                ext_p="$raw_p"
+                int_p="$raw_p"
+            fi
+            ufw allow "$ext_p"
+            echo "iptables -t nat -D PREROUTING -i $REAL_IF -p tcp --dport $ext_p -j DNAT --to-destination $ROUTER_IP:$int_p 2>/dev/null || true" >> "$UP_SCRIPT"
+            echo "iptables -t nat -D PREROUTING -i $REAL_IF -p udp --dport $ext_p -j DNAT --to-destination $ROUTER_IP:$int_p 2>/dev/null || true" >> "$UP_SCRIPT"
+            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $ext_p -j DNAT --to-destination $ROUTER_IP:$int_p # Port:$ext_p" >> "$UP_SCRIPT"
+            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $ext_p -j DNAT --to-destination $ROUTER_IP:$int_p # Port:$ext_p" >> "$UP_SCRIPT"
         done
     fi
     echo "exit 0" >> "$UP_SCRIPT"
@@ -711,7 +764,6 @@ apply_ttyd_cert() {
     W_PORT=$(grep "ExecStart" /etc/systemd/system/ttyd.service 2>/dev/null | grep -oP '(?<=-p )\d+')
     W_PORT=${W_PORT:-17681}
 
-    # Сохраняем текущие логин и пароль вместо сброса на admin:admin
     CUR_CREDS=$(grep "ExecStart" /etc/systemd/system/ttyd.service 2>/dev/null | grep -oP '(?<=-c ")[^"]+')
     CUR_CREDS=${CUR_CREDS:-admin:admin}
 
@@ -1164,6 +1216,46 @@ echo "OFF"
 EOF
     chmod +x /root/scripts/geoip_off.sh
 
+    # REAL IP TOGGLE FOR BOT
+    cat <<'EOF' > /root/scripts/realip_toggle.sh
+#!/bin/bash
+UP_SCRIPT="/etc/wireguard/up.sh"
+WG_CONF="/etc/wireguard/wg0.conf"
+if [ ! -f "$UP_SCRIPT" ]; then echo "ERROR"; exit 1; fi
+if grep -qE "^iptables.*-A POSTROUTING.*-o wg0 -j MASQUERADE" "$UP_SCRIPT"; then
+    sed -i '/-o wg0 -j MASQUERADE/d' "$UP_SCRIPT"
+    while iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null; do :; done
+    VPN_SUB=$(grep "^Address" "$WG_CONF" 2>/dev/null | awk '{print $3}' | head -1 | sed 's/\.[0-9]*\//.0\//')
+    [ -n "$VPN_SUB" ] && while iptables -t nat -D POSTROUTING -d "$VPN_SUB" -o wg0 -j MASQUERADE 2>/dev/null; do :; done
+    echo "REAL_ON"
+else
+    sed -i '/^exit 0/d' "$UP_SCRIPT"
+    echo "iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE" >> "$UP_SCRIPT"
+    echo "exit 0" >> "$UP_SCRIPT"
+    iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+    echo "REAL_OFF"
+fi
+EOF
+    chmod +x /root/scripts/realip_toggle.sh
+
+    # BACKUP FOR BOT
+    cat <<'EOF' > /root/scripts/make_backup.sh
+#!/bin/bash
+BACKUP_DIR="/root/vps_backups"
+mkdir -p "$BACKUP_DIR"
+ARCHIVE="$BACKUP_DIR/vps_backup_$(date '+%Y-%m-%d_%H-%M-%S').tar.gz"
+PATHS=()
+[ -d /etc/wireguard ] && PATHS+=("/etc/wireguard")
+[ -d /root/wg_clients ] && PATHS+=("/root/wg_clients")
+[ -d /etc/ipset ] && PATHS+=("/etc/ipset")
+[ -f /root/.tg_config ] && PATHS+=("/root/.tg_config")
+if [ ${#PATHS[@]} -eq 0 ]; then echo "ERROR"; exit 1; fi
+tar -czf "$ARCHIVE" "${PATHS[@]}" 2>/dev/null
+ls -1t "$BACKUP_DIR"/vps_backup_*.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm -f
+echo "OK|$ARCHIVE"
+EOF
+    chmod +x /root/scripts/make_backup.sh
+
     cat <<'EOF' > /root/scripts/monitor.sh
 #!/bin/bash
 if [ -f /root/.tg_config ]; then source /root/.tg_config; else exit 0; fi
@@ -1181,6 +1273,22 @@ if ! systemctl is-active --quiet wg-quick@wg0; then
         send_msg "⚠️ <b>WireGuard упал!</b>
 🚑 Watchdog: Служба успешно перезапущена."
     fi
+fi
+
+# МОНИТОРИНГ ДИСКА (>90%, уведомление не чаще 1 раза в 6 часов)
+DISK_PCT=$(df / | awk 'NR==2 {gsub("%",""); print $5}')
+DISK_FLAG="/tmp/vps_disk_alert"
+if [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 90 ]; then
+    NOW_TS=$(date +%s)
+    LAST_TS=$(cat "$DISK_FLAG" 2>/dev/null || echo 0)
+    if [ $((NOW_TS - LAST_TS)) -ge 21600 ]; then
+        DISK_LINE=$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')
+        send_msg "⚠️ <b>Мало места на диске VPS!</b>
+💾 Занято: <code>$DISK_LINE</code>"
+        echo "$NOW_TS" > "$DISK_FLAG"
+    fi
+else
+    rm -f "$DISK_FLAG"
 fi
 
 # ANTI-FLOOD
@@ -1238,17 +1346,24 @@ VPN_NET=$(grep "^Address" "$WG_CONF" 2>/dev/null | awk '{print $3}' | head -1)
 WG_PORT=$(grep "ListenPort" "$WG_CONF" 2>/dev/null | awk '{print $3}')
 SSH_PORT=$(grep "^Port " "$SSH_CONF" 2>/dev/null | awk '{print $2}'); [ -z "$SSH_PORT" ] && SSH_PORT="22"
 
+LOAD_AVG=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+RAM_INFO=$(free -m 2>/dev/null | awk '/Mem:/ {printf "%d/%dMB", $3, $2}')
+DISK_INFO=$(df -h / 2>/dev/null | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')
+
 if grep -q "match-set whitelist" "$UP_SCRIPT" 2>/dev/null; then GEO="✅ ON"; else GEO="❌ OFF"; fi
 if systemctl is-active --quiet ttyd; then WEB="🖥 ON"; else WEB="❌ OFF"; fi
 if grep -q "^PasswordAuthentication no" "$SSH_CONF"; then SSH_MODE="🔐 KEY"; else SSH_MODE="🔓 PASS"; fi
+if grep -qE "^iptables.*-A POSTROUTING.*-o wg0 -j MASQUERADE" "$UP_SCRIPT" 2>/dev/null; then REALIP="❌ NAT"; else REALIP="✅ Real"; fi
+if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]; then BBR="⚡ ON"; else BBR="OFF"; fi
 
-PORTS_INFO=$(grep "DNAT" "$UP_SCRIPT" 2>/dev/null | grep "dport" | grep -oP 'dport \K[0-9]+|to-destination \K[0-9.]+' | paste - - | sort -u | while read port ip; do
-    if [ -n "$port" ] && [ -n "$ip" ]; then
+PORTS_INFO=$(grep "DNAT" "$UP_SCRIPT" 2>/dev/null | grep "dport" | while read -r line; do
+    if [[ "$line" =~ --dport\ ([0-9]+).*--to-destination\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+) ]]; then
+        ep="${BASH_REMATCH[1]}"; ip="${BASH_REMATCH[2]}"; ip_p="${BASH_REMATCH[3]}"
         c_name=$(grep -B 5 "$ip/32" "$WG_CONF" | grep "# Client:" | awk '{print $3}')
         [ -z "$c_name" ] && c_name="$ip"
-        echo "$port ➜ $c_name"
+        [ "$ep" == "$ip_p" ] && echo "$ep ➜ $c_name" || echo "$ep:$ip_p ➜ $c_name"
     fi
-done)
+done | sort -u)
 
 [ -z "$PORTS_INFO" ] && PORTS_INFO="Нет"
 
@@ -1259,6 +1374,9 @@ echo "🕸 VPN Net: <code>$VPN_NET</code>"
 echo "🔌 WG Port: <code>$WG_PORT</code>"
 echo "🛡 SSH: <code>$SSH_PORT</code> ($SSH_MODE)"
 echo "🌍 GeoIP: $GEO | Web: $WEB"
+echo "🌐 Real IP: $REALIP | BBR: $BBR"
+echo "💻 CPU: <code>$LOAD_AVG</code> | RAM: <code>$RAM_INFO</code>"
+echo "💾 Disk: <code>$DISK_INFO</code>"
 echo "🚫 Banned: $(ls /proc/net/xt_recent/ 2>/dev/null | xargs -I {} cat /proc/net/xt_recent/{} 2>/dev/null | wc -l)"
 echo ""
 echo "<b>🔌 ОТКРЫТЫЕ ПОРТЫ:</b>"
@@ -1304,23 +1422,32 @@ echo "SET"
 EOF
     chmod +x /root/scripts/set_limit.sh
 
-    # ADD PORT
+    # ADD PORT (поддержка формата 8443:443 и 443)
     cat <<'EOF' > /root/scripts/add_port.sh
 #!/bin/bash
-CLIENT_NAME=$1; PORT=$2
+CLIENT_NAME=$1; RAW_PORT=$2
 UP_SCRIPT="/etc/wireguard/up.sh"; WG_CONF="/etc/wireguard/wg0.conf"
 REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
 TARGET_IP=$(grep -A 3 "# Client: $CLIENT_NAME" "$WG_CONF" | grep AllowedIPs | awk '{print $3}' | cut -d/ -f1)
 [ -z "$TARGET_IP" ] && echo "ERROR" && exit 1
 
-if grep -q "dport $PORT " "$UP_SCRIPT"; then echo "BUSY"; exit 1; fi
+if [[ "$RAW_PORT" == *:* ]]; then
+    EXT_PORT="${RAW_PORT%%:*}"
+    INT_PORT="${RAW_PORT##*:}"
+else
+    EXT_PORT="$RAW_PORT"
+    INT_PORT="$RAW_PORT"
+fi
 
-ufw allow "$PORT" >/dev/null 2>&1
-ufw route allow in on "$REAL_IF" out on wg0 to "$TARGET_IP" port "$PORT" >/dev/null 2>&1
+if ! [[ "$EXT_PORT" =~ ^[0-9]+$ ]] || ! [[ "$INT_PORT" =~ ^[0-9]+$ ]]; then echo "ERROR"; exit 1; fi
+if grep -q "dport $EXT_PORT " "$UP_SCRIPT"; then echo "BUSY"; exit 1; fi
+
+ufw allow "$EXT_PORT" >/dev/null 2>&1
+ufw route allow in on "$REAL_IF" out on wg0 to "$TARGET_IP" port "$INT_PORT" >/dev/null 2>&1
 
 sed -i '/^exit 0/d' "$UP_SCRIPT"
-echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $PORT -j DNAT --to-destination $TARGET_IP:$PORT # Port:$PORT" >> "$UP_SCRIPT"
-echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $PORT -j DNAT --to-destination $TARGET_IP:$PORT # Port:$PORT" >> "$UP_SCRIPT"
+echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $EXT_PORT -j DNAT --to-destination $TARGET_IP:$INT_PORT # Port:$EXT_PORT" >> "$UP_SCRIPT"
+echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $EXT_PORT -j DNAT --to-destination $TARGET_IP:$INT_PORT # Port:$EXT_PORT" >> "$UP_SCRIPT"
 echo "exit 0" >> "$UP_SCRIPT"
 
 systemctl restart wg-quick@wg0
@@ -1403,17 +1530,39 @@ if [ -f "$FILE" ]; then echo "FOUND|$FILE"; else echo "ERROR"; fi
 EOF
     chmod +x /root/scripts/get_file.sh
 
-    # CLIENTS INFO
+    # CLIENTS INFO (с онлайн-статусом и трафиком)
     cat <<'EOF' > /root/scripts/clients.sh
 #!/bin/bash
 WG_CONF="/etc/wireguard/wg0.conf"; UP_SCRIPT="/etc/wireguard/up.sh"
+
+fmt_b() {
+    local b=${1:-0}
+    if [ "$b" -ge 1073741824 ]; then awk -v x="$b" 'BEGIN {printf "%.1fG", x/1073741824}'
+    elif [ "$b" -ge 1048576 ]; then awk -v x="$b" 'BEGIN {printf "%.1fM", x/1048576}'
+    elif [ "$b" -ge 1024 ]; then awk -v x="$b" 'BEGIN {printf "%.0fK", x/1024}'
+    else echo "${b}B"; fi
+}
+
+declare -A m_on m_tr
+NOW_TS=$(date +%s)
+if ip link show wg0 >/dev/null 2>&1; then
+    while IFS=$'\t' read -r pub psk ep aips hs rx tx ka; do
+        [ -z "$aips" ] && continue
+        p_ip=$(echo "$aips" | cut -d/ -f1)
+        if [ -n "$hs" ] && [ "$hs" -gt 0 ] && [ $((NOW_TS - hs)) -lt 180 ]; then m_on[$p_ip]="🟢"; else m_on[$p_ip]="⚪"; fi
+        m_tr[$p_ip]=$(fmt_b $(( ${rx:-0} + ${tx:-0} )))
+    done < <(wg show wg0 dump 2>/dev/null | tail -n +2)
+fi
+
 echo "<b>👥 КЛИЕНТЫ:</b>"
 if [ -f "$WG_CONF" ]; then
     grep "# Client:" "$WG_CONF" | awk '{print $3}' | while read name; do
         ip=$(grep -A 3 "# Client: $name" "$WG_CONF" | grep AllowedIPs | awk '{print $3}' | cut -d/ -f1)
+        st="${m_on[$ip]:-⚪}"
+        tr="${m_tr[$ip]:-0B}"
         LIMIT=$(grep "# Client:$name" "$UP_SCRIPT" 2>/dev/null | grep "rate" | head -1 | awk -F'rate ' '{print $2}' | awk '{print $1}' | sed 's/mbit//')
         [ -n "$LIMIT" ] && LIMIT_STR="📉 ${LIMIT}Mb" || LIMIT_STR="♾️ Unlim"
-        echo "👤 <b>$name</b> <code>$ip</code> [$LIMIT_STR]"
+        echo "$st <b>$name</b> <code>$ip</code> [$LIMIT_STR | $tr]"
     done
 fi
 EOF
@@ -1490,11 +1639,13 @@ def main_menu():
     m.add("👥 Клиенты", "🔌 Добавить порт")
     m.add("➕ Создать Клиента", "🗑 Удалить Клиента")
     m.add("🚀 Лимит скорости", "❌ Удалить порт")
+    m.add("💾 Скачать бэкап")
     return m
 def security_menu():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     m.add("🔑 SSH Ключи", "🔐 Toggle SSH (Key/Pass)")
-    m.add("🌍 GeoIP Меню", "🔙 Назад")
+    m.add("🌍 GeoIP Меню", "🌐 Реальные IP (Real/NAT)")
+    m.add("🔙 Назад")
     return m
 def keys_menu():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -1508,7 +1659,7 @@ def back_menu():
 @bot.message_handler(commands=['start'])
 def start(m):
     if m.from_user.id != ADMIN_ID: return
-    bot.send_message(m.chat.id, "🛡👋 <b>Привет, Хозяин! Сервер в норме. </b>", reply_markup=main_menu(), parse_mode='HTML')
+    bot.send_message(m.chat.id, "🛡👋 <b>Привет, Хозяин! Сервер в норме.</b>", reply_markup=main_menu(), parse_mode='HTML')
 @bot.message_handler(func=lambda m: m.text == "🔙 Назад")
 def go_back(m): bot.send_message(m.chat.id, "Меню", reply_markup=main_menu())
 @bot.message_handler(func=lambda m: m.text == "🔙 Назад в Sec")
@@ -1519,6 +1670,26 @@ def cancel_op(m): bot.send_message(m.chat.id, "Отменено.", reply_markup=
 def status(m): bot.send_message(m.chat.id, call_script('status.sh'), parse_mode='HTML')
 @bot.message_handler(func=lambda m: m.text == "🛡 Безопасность")
 def sec(m): bot.send_message(m.chat.id, "🛡 Настройки:", reply_markup=security_menu())
+@bot.message_handler(func=lambda m: m.text == "💾 Скачать бэкап")
+def send_bk(m):
+    if m.from_user.id != ADMIN_ID: return
+    bot.send_message(m.chat.id, "⏳ Создаю архив...")
+    res = call_script('make_backup.sh')
+    if "OK|" in res:
+        try:
+            with open(res.split("|")[1], 'rb') as f:
+                bot.send_document(m.chat.id, f, caption="💾 Резервная копия VPS", reply_markup=main_menu())
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Ошибка отправки: {e}", reply_markup=main_menu())
+    else:
+        bot.send_message(m.chat.id, "❌ Ошибка создания бэкапа.", reply_markup=main_menu())
+@bot.message_handler(func=lambda m: m.text == "🌐 Реальные IP (Real/NAT)")
+def realip_tog(m):
+    res = call_script('realip_toggle.sh')
+    if "REAL_ON" in res: msg = "✅ Реальные IP <b>ВКЛЮЧЕНЫ</b> (MASQUERADE на wg0 удален)."
+    elif "REAL_OFF" in res: msg = "⚠️ Реальные IP <b>ВЫКЛЮЧЕНЫ</b> (включен NAT/MASQUERADE на wg0)."
+    else: msg = "❌ Ошибка переключения."
+    bot.send_message(m.chat.id, msg, parse_mode='HTML', reply_markup=security_menu())
 @bot.message_handler(func=lambda m: m.text == "🔑 SSH Ключи")
 def keys_main(m): bot.send_message(m.chat.id, "Управление:", reply_markup=keys_menu())
 @bot.message_handler(func=lambda m: m.text == "🆕 Создать Ключ")
@@ -1698,16 +1869,19 @@ def add_p_2(m, items):
     if not m.text.isdigit(): return
     idx = int(m.text) - 1
     if 0 <= idx < len(items):
-        msg = bot.send_message(m.chat.id, f"⌨️ Порт для {items[idx]}:")
+        msg = bot.send_message(m.chat.id, f"⌨️ Порт для {items[idx]} (напр: 443 или 8443:443):")
         bot.register_next_step_handler(msg, add_p_3, items[idx])
     else: bot.send_message(m.chat.id, "Ошибка.")
 def add_p_3(m, name):
-    if not m.text.isdigit(): return
-    call_script('add_port.sh', name, m.text)
-    bot.send_message(m.chat.id, "✅ Порт открыт.", reply_markup=main_menu())
+    val = m.text.strip()
+    if not val.replace(":", "").isdigit(): return
+    res = call_script('add_port.sh', name, val)
+    if "SUCCESS" in res: bot.send_message(m.chat.id, "✅ Порт открыт.", reply_markup=main_menu())
+    elif "BUSY" in res: bot.send_message(m.chat.id, "⚠️ Внешний порт уже занят.", reply_markup=main_menu())
+    else: bot.send_message(m.chat.id, "❌ Ошибка.", reply_markup=main_menu())
 @bot.message_handler(func=lambda m: m.text == "❌ Удалить порт")
 def del_p(m):
-    msg = bot.send_message(m.chat.id, "⌨️ Номер порта:", reply_markup=back_menu())
+    msg = bot.send_message(m.chat.id, "⌨️ Внешний номер порта:", reply_markup=back_menu())
     bot.register_next_step_handler(msg, del_p_2)
 def del_p_2(m):
     if m.text == "🔙 Отмена": start(m); return
@@ -1744,10 +1918,13 @@ manage_backup() {
 
     while true; do
         clear
+        BK_CRON_ST=$(crontab -l 2>/dev/null | grep -q "backup_tg" && echo -e "\e[1;32mВКЛ\e[0m" || echo -e "\e[1;31mВЫКЛ\e[0m")
         echo -e "=== 💾 БЭКАП И ВОССТАНОВЛЕНИЕ ==="
-        echo "1) 📦 Создать резервную копию"
-        echo "2) ♻️ Восстановить из резервной копии"
-        echo "3) 📋 Список бэкапов"
+        echo "1) 📦 Создать резервную копию (локально)"
+        echo "2) 📤 Создать и отправить бэкап в Telegram"
+        echo -e "3) 🔄 Автобэкап в Telegram (Вс, 04:00) [ $BK_CRON_ST ]"
+        echo "4) ♻️ Восстановить из резервной копии"
+        echo "5) 📋 Список бэкапов"
         echo "0) 🔙 Назад"
         read -p "Выбор: " BK_OPT
 
@@ -1768,6 +1945,24 @@ manage_backup() {
                 fi
                 ;;
             2)
+                if [ ! -f /root/.tg_config ]; then
+                    echo "❌ Сначала настройте Telegram-бота (пункт 9 главного меню)."
+                else
+                    /usr/local/bin/vps backup_tg
+                    echo "✅ Бэкап создан и отправлен в Telegram."
+                fi
+                ;;
+            3)
+                CRON_BK="0 4 * * 0 /usr/local/bin/vps backup_tg > /dev/null 2>&1"
+                if crontab -l 2>/dev/null | grep -q "backup_tg"; then
+                    crontab -l 2>/dev/null | grep -v "backup_tg" | crontab -
+                    echo "❌ Автобэкап в Telegram отключен."
+                else
+                    (crontab -l 2>/dev/null | grep -v "backup_tg"; echo "$CRON_BK") | crontab -
+                    echo "✅ Автобэкап в Telegram включен (каждое воскресенье в 04:00)."
+                fi
+                ;;
+            4)
                 mapfile -t BACKUPS < <(ls -1t "$BACKUP_DIR"/vps_backup_*.tar.gz 2>/dev/null)
                 if [ ${#BACKUPS[@]} -eq 0 ]; then
                     echo "❌ Бэкапы не найдены в $BACKUP_DIR."
@@ -1788,7 +1983,7 @@ manage_backup() {
                     fi
                 fi
                 ;;
-            3)
+            5)
                 echo -e "\nФайлы в $BACKUP_DIR:"
                 ls -lh "$BACKUP_DIR"/vps_backup_*.tar.gz 2>/dev/null || echo "Пусто."
                 ;;
@@ -1798,9 +1993,51 @@ manage_backup() {
     done
 }
 
+toggle_bbr() {
+    CUR_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$CUR_CC" == "bbr" ]; then
+        rm -f /etc/sysctl.d/99-vps-bbr.conf
+        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+        echo -e "⚠️ TCP BBR \e[1;31mВЫКЛЮЧЕН\e[0m (возвращен cubic)."
+    else
+        cat <<EOF > /etc/sysctl.d/99-vps-bbr.conf
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+        sysctl --system >/dev/null 2>&1
+        if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]; then
+            echo -e "✅ TCP BBR \e[1;32mВКЛЮЧЕН\e[0m (ускорение TCP через VPN активно)."
+        else
+            echo -e "❌ Не удалось включить BBR (возможно, ядро не поддерживает)."
+        fi
+    fi
+}
+
+self_update() {
+    echo -e "📥 Скачиваю свежую версию с GitHub..."
+    TMP_SCRIPT="/tmp/vps_update.sh"
+    if ! curl -fsSL --connect-timeout 10 "$REPO_URL" -o "$TMP_SCRIPT"; then
+        echo -e "\e[1;31m❌ Ошибка скачивания ($REPO_URL).\e[0m"
+        return 1
+    fi
+    sed -i 's/\r$//' "$TMP_SCRIPT"
+    if ! bash -n "$TMP_SCRIPT"; then
+        echo -e "\e[1;31m❌ Ошибка синтаксиса в скачанном файле! Обновление отменено.\e[0m"
+        rm -f "$TMP_SCRIPT"
+        return 1
+    fi
+    cp "$TMP_SCRIPT" /usr/local/bin/vps
+    chmod +x /usr/local/bin/vps
+    rm -f "$TMP_SCRIPT"
+    echo -e "\e[1;32m✅ Скрипт успешно обновлен! Перезапускаю...\e[0m"
+    sleep 1
+    exec /usr/local/bin/vps
+}
+
 show_tech_menu() {
     while true; do
         clear
+        BBR_ST=$([ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ] && echo -e "\e[1;32mВКЛ\e[0m" || echo -e "\e[1;31mВЫКЛ\e[0m")
         echo -e "=== ⚙️ ТЕХНИЧЕСКОЕ ОБСЛУЖИВАНИЕ ==="
         echo "1) 🔄 Рестарт SSH"
         echo "2) 🚀 Рестарт WireGuard (wg0)"
@@ -1811,6 +2048,8 @@ show_tech_menu() {
         echo "7) 🌀 REBOOT (Перезагрузка всей системы)"
         echo -e "8) 🌐 \e[1;32mУПРАВЛЕНИЕ WEB-ПАНЕЛЬЮ\e[0m"
         echo -e "9) 💾 \e[1;36mБЭКАП / ВОССТАНОВЛЕНИЕ\e[0m"
+        echo -e "10) ⚡ TCP BBR [ $BBR_ST ]"
+        echo -e "11) ⬆️  \e[1;33mОБНОВИТЬ СКРИПТ С GITHUB\e[0m"
         echo "0) 🔙 Назад"
         read -p "Выбор: " T_OPT
 
@@ -1833,6 +2072,8 @@ show_tech_menu() {
                [ "$CONFIRM" == "y" ] && reboot ;;
             8) manage_web_panel ;;
             9) manage_backup ;;
+            10) toggle_bbr ;;
+            11) self_update ;;
             0) break ;;
         esac
         read -p "Enter..." temp
@@ -1841,7 +2082,7 @@ show_tech_menu() {
 
 while true; do
     clear; show_infra
-    echo "=== 🛡️ VPS MANAGER v3.1 ==="
+    echo "=== 🛡️ VPS MANAGER v3.2 ==="
     echo -e "1) 🛠 ПОЛНАЯ УСТАНОВКА"
     echo -e "2) 🔐 ЦЕНТР БЕЗОПАСНОСТИ"
     echo -e "3) 🔌 ДОБАВИТЬ ПОРТ"
@@ -1859,6 +2100,7 @@ while true; do
         2) manage_security ;;
         3)
             echo -e "\n\e[1;34m=== 🔌 ПРОБРОС ПОРТОВ (СПИСКОМ) ===\e[0m"
+            echo -e "Формат: \e[1;33m443\e[0m (1-в-1) или \e[1;33m8443:443\e[0m (Внешний:Внутренний)"
             read -p "Введите порты (через пробел или запятую): " RAW_PORTS
             [ -z "$RAW_PORTS" ] && continue
 
@@ -1896,24 +2138,36 @@ while true; do
             echo "🛡 Защита: 1)Стандарт 2)Строго 3)Выкл"; read -p "Выбор [1]: " P_PROT
             case $P_PROT in 2) H=10; S=86400 ;; 3) H=0; S=0 ;; *) H=5; S=60 ;; esac
 
-            for N_PORT in $CLEAN_PORTS; do
-                echo -e "⚙️ Обработка порта \e[1;33m$N_PORT\e[0m..."
-
-                if grep -q "dport $N_PORT " "$UP_SCRIPT"; then
-                    sed -i "/--dport $N_PORT /d" "$UP_SCRIPT"
-                    sed -i "/name PORT_$N_PORT/d" "$UP_SCRIPT"
+            for RAW_P in $CLEAN_PORTS; do
+                if [[ "$RAW_P" == *:* ]]; then
+                    EXT_P="${RAW_P%%:*}"
+                    INT_P="${RAW_P##*:}"
+                else
+                    EXT_P="$RAW_P"
+                    INT_P="$RAW_P"
+                fi
+                if ! [[ "$EXT_P" =~ ^[0-9]+$ ]] || ! [[ "$INT_P" =~ ^[0-9]+$ ]]; then
+                    echo -e "\e[1;31m⚠️ Пропуск некорректного порта: $RAW_P\e[0m"
+                    continue
                 fi
 
-                ufw allow "$N_PORT" >/dev/null 2>&1
+                echo -e "⚙️ Обработка порта \e[1;33m$EXT_P -> $TARGET_IP:$INT_P\e[0m..."
+
+                if grep -q "dport $EXT_P " "$UP_SCRIPT"; then
+                    sed -i "/--dport $EXT_P /d" "$UP_SCRIPT"
+                    sed -i "/name PORT_$EXT_P/d" "$UP_SCRIPT"
+                fi
+
+                ufw allow "$EXT_P" >/dev/null 2>&1
                 sed -i '/^exit 0/d' "$UP_SCRIPT"
 
                 if [ "$H" -ne 0 ]; then
-                    echo "iptables -I FORWARD -i $REAL_IF -p tcp --dport $N_PORT -m state --state NEW -m recent --set --name PORT_$N_PORT" >> "$UP_SCRIPT"
-                    echo "iptables -I FORWARD -i $REAL_IF -p tcp --dport $N_PORT -m state --state NEW -m recent --update --seconds $S --hitcount $H --name PORT_$N_PORT -j DROP" >> "$UP_SCRIPT"
+                    echo "iptables -I FORWARD -i $REAL_IF -p tcp --dport $EXT_P -m state --state NEW -m recent --set --name PORT_$EXT_P" >> "$UP_SCRIPT"
+                    echo "iptables -I FORWARD -i $REAL_IF -p tcp --dport $EXT_P -m state --state NEW -m recent --update --seconds $S --hitcount $H --name PORT_$EXT_P -j DROP" >> "$UP_SCRIPT"
                 fi
 
-                echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $N_PORT -j DNAT --to-destination $TARGET_IP:$N_PORT # Port:$N_PORT to $T_NAME" >> "$UP_SCRIPT"
-                echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $N_PORT -j DNAT --to-destination $TARGET_IP:$N_PORT # Port:$N_PORT to $T_NAME" >> "$UP_SCRIPT"
+                echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $EXT_P -j DNAT --to-destination $TARGET_IP:$INT_P # Port:$EXT_P to $T_NAME" >> "$UP_SCRIPT"
+                echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $EXT_P -j DNAT --to-destination $TARGET_IP:$INT_P # Port:$EXT_P to $T_NAME" >> "$UP_SCRIPT"
                 echo "exit 0" >> "$UP_SCRIPT"
             done
 
@@ -1929,9 +2183,9 @@ while true; do
             fi
 
             echo "Текущие правила:"
-            grep "DNAT" "$UP_SCRIPT" | awk -F'--dport ' '{print $2}' | awk '{print "ID: " NR " | Порт: " $1}'
+            grep "DNAT" "$UP_SCRIPT" | awk -F'--dport ' '{print $2}' | awk '{print "ID: " NR " | Внешний порт: " $1}'
 
-            read -p "Введите НОМЕР ПОРТА для удаления: " D_PORT
+            read -p "Введите ВНЕШНИЙ НОМЕР ПОРТА для удаления: " D_PORT
             [ -z "$D_PORT" ] && continue
 
             if grep -q "dport $D_PORT " "$UP_SCRIPT"; then
@@ -2103,3 +2357,4 @@ while true; do
         0) exit 0 ;;
     esac
 done
+
