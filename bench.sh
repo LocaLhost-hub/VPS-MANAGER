@@ -1,39 +1,100 @@
 #!/bin/bash
 
+# ЦВЕТА
+green='\e[1;32m'
+red='\e[1;31m'
+yellow='\e[1;33m'
+blue='\e[1;34m'
+cyan='\e[1;36m'
+plain='\e[0m'
 
-#ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 if ! command -v curl >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1 && apt-get install -y curl >/dev/null 2>&1
 fi
-
-
 
 REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
 SSH_CONF="/etc/ssh/sshd_config"
 WG_CONF="/etc/wireguard/wg0.conf"
 UP_SCRIPT="/etc/wireguard/up.sh"
 CLIENT_DIR="/root/wg_clients"
+SSH_KEY_DIR="/etc/wireguard/ssh_key"
 
 SSH_PORT=$(grep "^Port " "$SSH_CONF" 2>/dev/null | awk '{print $2}'); SSH_PORT=${SSH_PORT:-10022}
 WG_PORT=$(grep "ListenPort" "$WG_CONF" 2>/dev/null | awk '{print $3}'); WG_PORT=${WG_PORT:-51820}
 
-
 [ "$EUID" -ne 0 ] && echo "Запустите через sudo!" && exit 1
 
+# --- ОБРАБОТЧИК АВТООБНОВЛЕНИЯ GEOIP (ДЛЯ CRON) ---
+if [ "$1" == "update_geoip" ]; then
+    IPSET_CONF="/etc/ipset/whitelist.conf"
+    LOG_FILE="/var/log/vps_geoip.log"
+    COUNTRIES=$(grep "^# GeoIP_Countries:" "$UP_SCRIPT" 2>/dev/null | cut -d: -f2- | xargs)
 
+    if [ -z "$COUNTRIES" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M'): GeoIP не настроен, пропуск." >> "$LOG_FILE"
+        exit 0
+    fi
+
+    mkdir -p /etc/ipset
+    ipset create whitelist hash:net -! 2>/dev/null
+    ipset destroy whitelist_new 2>/dev/null
+    ipset create whitelist_new hash:net -!
+
+    UPDATED=0
+    for country in $COUNTRIES; do
+        c=$(echo "$country" | tr '[:upper:]' '[:lower:]')
+        if curl -s -f --connect-timeout 10 "http://www.ipdeny.com/ipblocks/data/countries/${c}.zone" > /tmp/country_cron.zone; then
+            while read -r line; do
+                [ -n "$line" ] && ipset add whitelist_new "$line" -! 2>/dev/null
+            done < /tmp/country_cron.zone
+            UPDATED=1
+        fi
+    done
+    rm -f /tmp/country_cron.zone
+
+    if [ "$UPDATED" -eq 1 ]; then
+        ipset swap whitelist_new whitelist
+        ipset destroy whitelist_new 2>/dev/null
+        ipset save whitelist > "$IPSET_CONF"
+        echo "$(date '+%Y-%m-%d %H:%M'): Обновлено ($COUNTRIES)" >> "$LOG_FILE"
+    else
+        ipset destroy whitelist_new 2>/dev/null
+        echo "$(date '+%Y-%m-%d %H:%M'): Ошибка загрузки списков ($COUNTRIES)" >> "$LOG_FILE"
+    fi
+    exit 0
+fi
 
 CACHED_IP=$(curl -4 -s --connect-timeout 3 eth0.me || curl -4 -s --connect-timeout 3 ifconfig.me)
 
+# Применение изменений пиров WireGuard без разрыва текущих соединений
+reload_wg_peers() {
+    if ip link show wg0 >/dev/null 2>&1; then
+        wg syncconf wg0 <(wg-quick strip wg0)
+    else
+        systemctl restart wg-quick@wg0
+    fi
+}
 
-
-
+# Форматирование байт в человекочитаемый вид
+format_bytes() {
+    local bytes=${1:-0}
+    if [ "$bytes" -ge 1073741824 ]; then
+        awk -v b="$bytes" 'BEGIN {printf "%.1fG", b/1073741824}'
+    elif [ "$bytes" -ge 1048576 ]; then
+        awk -v b="$bytes" 'BEGIN {printf "%.1fM", b/1048576}'
+    elif [ "$bytes" -ge 1024 ]; then
+        awk -v b="$bytes" 'BEGIN {printf "%.0fK", b/1024}'
+    else
+        echo "${bytes}B"
+    fi
+}
 
 generate_peer_config() {
     local NAME=$1; local IP=$2; local DNS_SRV=$3; local PUB_K=$4; local IS_ROUTER=$5
     local CP=$(wg genkey); local CB=$(echo "$CP" | wg pubkey)
     [ -n "$(tail -c 1 "$WG_CONF" 2>/dev/null)" ] && echo "" >> "$WG_CONF"
 
-   
     echo "# Client: $NAME" >> "$WG_CONF"
     echo "[Peer]" >> "$WG_CONF"
     echo "PublicKey = $CB" >> "$WG_CONF"
@@ -53,9 +114,6 @@ PersistentKeepalive = 25
 EOF
 }
 
-
-
-
 show_infra() {
     clear
     echo -e " \e[1;32m"
@@ -65,26 +123,28 @@ show_infra() {
     echo "    \ \/ / |  ___/ \___ \  | |\/| | / /\ \ | . \` | / /\ \| | |_ |  __| |  _  / "
     echo "     \  /  | |     ____) | | |  | |/ ____ \| |\  |/ ____ \ |__| | |____| | \ \ "
     echo "      \/   |_|    |_____/  |_|  |_/_/    \_\_| \_/_/    \_\_____|______|_|  \_\\"
-    echo -e "                          \e[1;34m🔥 СИСТЕМА УПРАВЛЕНИЯ VPS 🔥\e[0m"
+    echo -e "                          \e[1;34m🔥 СИСТЕМА УПРАВЛЕНИЯ VPS v3.1 🔥\e[0m"
 
-    
     GW_IP=$(ip -4 route show default | awk '/default/ {print $3}')
     VPN_NET=$(grep "^Address" "$WG_CONF" 2>/dev/null | awk '{print $3}' | head -1)
-    
-    
+
     CURRENT_SSH_PORT=$(grep "^Port " "$SSH_CONF" 2>/dev/null | awk '{print $2}')
     CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
     CURRENT_WG_PORT=$(grep "ListenPort" "$WG_CONF" 2>/dev/null | awk '{print $3}')
     CURRENT_WG_PORT=${CURRENT_WG_PORT:-51820}
-    
-   
+
     if grep -q "match-set whitelist" "$UP_SCRIPT" 2>/dev/null && [ -s /etc/ipset/whitelist.conf ]; then
         GEO_STATUS="\e[1;32mON (Вкл)\e[0m"
     else
         GEO_STATUS="\e[1;30mOFF (Выкл)\e[0m"
     fi
-    
-    
+
+    if grep -qE "^iptables.*-A POSTROUTING.*-o wg0 -j MASQUERADE" "$UP_SCRIPT" 2>/dev/null; then
+        REALIP_STATUS="\e[1;31mOFF (NAT)\e[0m"
+    else
+        REALIP_STATUS="\e[1;32mON (Real)\e[0m"
+    fi
+
     if systemctl is-active --quiet ttyd; then
         SERV_CFG="/etc/systemd/system/ttyd.service"
         if grep -q "\-i 127.0.0.1" "$SERV_CFG" 2>/dev/null; then
@@ -97,8 +157,7 @@ show_infra() {
     else
         WEB_STATUS="\e[1;31m❌ OFF\e[0m"
     fi
-    
-   
+
     PASS_AUTH=$(grep -v "^#" "$SSH_CONF" 2>/dev/null | grep "PasswordAuthentication" | awk '{print $2}')
     if [ "${PASS_AUTH:-yes}" == "yes" ]; then
         SSH_TXT="\e[1;31m🔓 PASS\e[0m"
@@ -106,14 +165,12 @@ show_infra() {
         SSH_TXT="\e[1;32m🔐 KEYS\e[0m"
     fi
 
-   
     echo -e "\n\e[1;34m=== 📊 СВОДКА СЕРВЕРА ===\e[0m"
     printf " 📡 %-25s %-25s\n" "WAN: ${CACHED_IP:-...}" "GATEWAY: ${GW_IP:-ND}"
     printf " 🕸️ %-25s %-25s\n" "VPN: ${VPN_NET:-ND}"   "WG PORT: $CURRENT_WG_PORT"
     printf " 🖥️ WEB: %-34b 🌍 GEOIP: %b\n" "$WEB_STATUS" "$GEO_STATUS"
-    printf " 🛡️ SSH: %-34b PORT: %s\n" "$SSH_TXT" "$CURRENT_SSH_PORT"
-    
-   
+    printf " 🛡️ SSH: %-34b PORT: %-10s 🌐 IP: %b\n" "$SSH_TXT" "$CURRENT_SSH_PORT" "$REALIP_STATUS"
+
     declare -A map_ports
     if [ -f "$UP_SCRIPT" ]; then
         while read -r line; do
@@ -133,10 +190,27 @@ show_infra() {
         done < "$UP_SCRIPT"
     fi
 
-   
+    # Сбор статусов онлайн и трафика из wg show wg0 dump
+    declare -A map_online
+    declare -A map_traffic
+    NOW_TS=$(date +%s)
+    if ip link show wg0 >/dev/null 2>&1; then
+        while IFS=$'\t' read -r pub psk ep aips hs rx tx ka; do
+            [ -z "$aips" ] && continue
+            p_ip=$(echo "$aips" | cut -d/ -f1)
+            if [ -n "$hs" ] && [ "$hs" -gt 0 ] && [ $((NOW_TS - hs)) -lt 180 ]; then
+                map_online[$p_ip]="🟢"
+            else
+                map_online[$p_ip]="⚪"
+            fi
+            total_b=$(( ${rx:-0} + ${tx:-0} ))
+            map_traffic[$p_ip]=$(format_bytes "$total_b")
+        done < <(wg show wg0 dump 2>/dev/null | tail -n +2)
+    fi
+
     echo -e "\n\e[1;34m=== 👥 СПИСОК КЛИЕНТОВ ===\e[0m"
-    printf "\e[1;33m %-14s  %-15s  %-20s  %-10s\e[0m\n" "CLIENT" "IP" "PORTS" "LIMIT"
-    echo " ----------------------------------------------------------------"
+    printf "\e[1;33m %-2s %-13s  %-15s  %-18s  %-10s  %-8s\e[0m\n" "ST" "CLIENT" "IP" "PORTS" "LIMIT" "TRAFFIC"
+    echo " ---------------------------------------------------------------------------"
 
     if [ -f "$WG_CONF" ]; then
         current_name=""
@@ -146,38 +220,39 @@ show_infra() {
             elif [[ "$line" =~ AllowedIPs\ =\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
                 if [ -n "$current_name" ]; then
                     ip="${BASH_REMATCH[1]}"
+                    st="${map_online[$ip]:-⚪}"
+                    traf="${map_traffic[$ip]:-0B}"
                     ports="${map_ports[$ip]}"
                     [ -z "$ports" ] && ports_d="\e[1;30m-\e[0m" || ports_d="\e[1;32m$ports\e[0m"
                     limit=$(grep -a "# Client:$current_name" "$UP_SCRIPT" 2>/dev/null | grep "rate" | head -1 | awk -F'rate ' '{print $2}' | awk '{print $1}' | sed 's/mbit//')
-                    
-                    [ -z "$limit" ] && speed_d="\e[1;35m♾️  Unlim\e[0m" || speed_d="\e[1;33m📉 ${limit}Mb\e[0m"
 
-                    printf " \e[1;37m%-14s\e[0m  %-15s  %-35b  %-20b\n" "$current_name" "$ip" "$ports_d" "$speed_d"
+                    [ -z "$limit" ] && speed_d="\e[1;35m♾️ Unlim\e[0m" || speed_d="\e[1;33m📉 ${limit}Mb\e[0m"
+
+                    printf " %s \e[1;37m%-13s\e[0m  %-15s  %-29b  %-19b  \e[1;36m%-8s\e[0m\n" "$st" "$current_name" "$ip" "$ports_d" "$speed_d" "$traf"
                     current_name=""
                 fi
             fi
         done < "$WG_CONF"
     fi
-    echo " ----------------------------------------------------------------"
+    echo " ---------------------------------------------------------------------------"
     echo ""
 }
 
 manage_security() {
-
-    SSH_KEY_DIR="/etc/wireguard/ssh_key"
     mkdir -p "$SSH_KEY_DIR" && chmod 700 "$SSH_KEY_DIR"
 
-   while true; do
+    while true; do
         clear
         LAST_UP=$(tail -n 1 /var/log/vps_geoip.log 2>/dev/null | cut -d: -f1-2)
         [ -z "$LAST_UP" ] && LAST_UP="Никогда"
         CRON_ST=$(crontab -l 2>/dev/null | grep -q "update_geoip" && echo -e "\e[1;32mВКЛ\e[0m" || echo -e "\e[1;31mВЫКЛ\e[0m")
-CRON_ST=$(crontab -l 2>/dev/null | grep -q "update_geoip" && echo -e "\e[1;32mВКЛ\e[0m" || echo -e "\e[1;31mВЫКЛ\e[0m")
+
         if grep -qE "^iptables.*-A POSTROUTING.*-o wg0 -j MASQUERADE" "$UP_SCRIPT" 2>/dev/null; then
             REAL_IP_ST="\e[1;31mВЫКЛ (NAT)\e[0m"
         else
             REAL_IP_ST="\e[1;32mВКЛ\e[0m"
         fi
+
         echo -e "=== 🔐 ЦЕНТР БЕЗОПАСНОСТИ ==="
         echo "1) 🔑 Переключить SSH пароль (Вкл/Выкл)"
         echo "2) 🚀 Изменить SSH порт"
@@ -187,25 +262,24 @@ CRON_ST=$(crontab -l 2>/dev/null | grep -q "update_geoip" && echo -e "\e[1;32mВ
         echo "6) 🔓 ОТКЛЮЧИТЬ GeoIP фильтрацию"
         echo -e "7) \e[1;32m🔑 УПРАВЛЕНИЕ SSH КЛЮЧАМИ\e[0m"
         echo -e "8) 🔄 Автообновление GeoIP [ $CRON_ST ] | Last: \e[1;33m$LAST_UP\e[0m"
-		echo "9) 🚑 Разбанить IP"
-		echo -e "10) 🌐 Реальные IP клиентов [ $REAL_IP_ST ]"
+        echo "9) 🚑 Разбанить IP"
+        echo -e "10) 🌐 Реальные IP клиентов [ $REAL_IP_ST ]"
         echo "0) 🔙 Назад"
         read -p "Выбор: " S_OPT
-        
-case $S_OPT in
-            1) PASS_AUTH=$(grep "^PasswordAuthentication" $SSH_CONF | awk '{print $2}')
+
+        case $S_OPT in
+            1) PASS_AUTH=$(grep "^PasswordAuthentication" "$SSH_CONF" | awk '{print $2}')
                [ "$PASS_AUTH" == "yes" ] && VAL="no" || VAL="yes"
-               sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication $VAL/" $SSH_CONF
-               sed -i "s/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication $VAL/" $SSH_CONF
+               sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication $VAL/" "$SSH_CONF"
+               sed -i "s/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication $VAL/" "$SSH_CONF"
                systemctl restart ssh ;;
             2) read -p "Новый SSH порт: " NEW_SSH
                if [[ "$NEW_SSH" =~ ^[0-9]+$ ]]; then
                    ufw delete allow "$SSH_PORT/tcp" && ufw allow "$NEW_SSH/tcp"
-                   sed -i "s/^Port .*/Port $NEW_SSH/" $SSH_CONF
+                   sed -i "s/^Port .*/Port $NEW_SSH/" "$SSH_CONF"
                    SSH_PORT=$NEW_SSH
                    systemctl restart ssh
-                   
-                   
+
                    echo "🛡 Обновляем Fail2Ban..."
                    cat <<EOF > /etc/fail2ban/jail.d/sshd-custom.local
 [sshd]
@@ -216,82 +290,75 @@ backend = %(sshd_backend)s
 EOF
                    systemctl restart fail2ban
                    echo "✅ Порт изменен, защита обновлена."
-                   # ---------------------------
                fi ;;
             3) read -p "Новый WG порт: " NEW_WG
                if [[ "$NEW_WG" =~ ^[0-9]+$ ]]; then
                    ufw delete allow "$WG_PORT/udp" && ufw allow "$NEW_WG/udp"
-                   sed -i "s/ListenPort = .*/ListenPort = $NEW_WG/" $WG_CONF
-                   sed -i "s/Endpoint = \(.*\):.*/Endpoint = \1:$NEW_WG/" $CLIENT_DIR/*.conf
+                   sed -i "s/ListenPort = .*/ListenPort = $NEW_WG/" "$WG_CONF"
+                   sed -i "s/Endpoint = \(.*\):.*/Endpoint = \1:$NEW_WG/" "$CLIENT_DIR"/*.conf 2>/dev/null
                    WG_PORT=$NEW_WG; systemctl restart wg-quick@wg0
                fi ;;
-           4) 
-           
-           IPSET_CONF="/etc/ipset/whitelist.conf"
-           REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
-           
-           echo "Введите коды стран через пробел (например: ru by kz):"
-           read -p "Страны: " COUNTRIES; [ -z "$COUNTRIES" ] && return
-           
-           
-           mkdir -p /etc/ipset
-           ipset create whitelist hash:net -! 2>/dev/null
-           ipset flush whitelist
-           
-        
-           for country in $COUNTRIES; do
-               echo "📥 Загрузка базы для ${country^^}..."
-               if curl -s -f "http://www.ipdeny.com/ipblocks/data/countries/${country,,}.zone" > /tmp/country.zone; then
-                   while read -r line; do ipset add whitelist "$line" -! 2>/dev/null; done < /tmp/country.zone
-                   echo "✅ ${country^^} добавлена."
-               fi
-           done
-           ipset save whitelist > "$IPSET_CONF"
-           sed -i '/# GeoIP_Countries:/d' "$UP_SCRIPT"
-           sed -i '/match-set whitelist/d' "$UP_SCRIPT"
-           sed -i '/ipset restore/d' "$UP_SCRIPT"
-           sed -i '/^exit 0/d' "$UP_SCRIPT"
-           echo "# GeoIP_Countries: $COUNTRIES" >> "$UP_SCRIPT"
-           cat <<EOF >> "$UP_SCRIPT"
+            4)
+               IPSET_CONF="/etc/ipset/whitelist.conf"
+               REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
+
+               echo "Введите коды стран через пробел (например: ru by kz):"
+               read -p "Страны: " COUNTRIES; [ -z "$COUNTRIES" ] && continue
+
+               mkdir -p /etc/ipset
+               ipset create whitelist hash:net -! 2>/dev/null
+               ipset flush whitelist
+
+               for country in $COUNTRIES; do
+                   echo "📥 Загрузка базы для ${country^^}..."
+                   if curl -s -f "http://www.ipdeny.com/ipblocks/data/countries/${country,,}.zone" > /tmp/country.zone; then
+                       while read -r line; do ipset add whitelist "$line" -! 2>/dev/null; done < /tmp/country.zone
+                       echo "✅ ${country^^} добавлена."
+                   fi
+               done
+               ipset save whitelist > "$IPSET_CONF"
+               sed -i '/# GeoIP_Countries:/d' "$UP_SCRIPT"
+               sed -i '/if \[ -s .*whitelist.* \]/,/fi/d' "$UP_SCRIPT"
+               sed -i '/match-set whitelist/d' "$UP_SCRIPT"
+               sed -i '/ipset restore/d' "$UP_SCRIPT"
+               sed -i '/^exit 0/d' "$UP_SCRIPT"
+               echo "# GeoIP_Countries: $COUNTRIES" >> "$UP_SCRIPT"
+               cat <<EOF >> "$UP_SCRIPT"
 if [ -s $IPSET_CONF ]; then
     ipset restore -! < $IPSET_CONF 2>/dev/null || true
     iptables -I FORWARD -i $REAL_IF -m state --state NEW -m set ! --match-set whitelist src -j DROP # GeoIP
 fi
 exit 0
 EOF
-
-           ipset restore -! < "$IPSET_CONF" 2>/dev/null
-           iptables -D FORWARD -i "$REAL_IF" -m state --state NEW -m set ! --match-set whitelist src -j DROP 2>/dev/null
-           iptables -I FORWARD -i "$REAL_IF" -m state --state NEW -m set ! --match-set whitelist src -j DROP
-           echo "✅ GeoIP фильтр включен."
-           ;;
-
-            5) 
-           sed -i '/-m recent/d' $UP_SCRIPT
-           iptables -F FORWARD
-           bash $UP_SCRIPT
-           rm -f /proc/net/xt_recent/* 2>/dev/null
-           
-           echo "✅ Защита портов ПОЛНОСТЬЮ снята." ;;
+               ipset restore -! < "$IPSET_CONF" 2>/dev/null
+               iptables -D FORWARD -i "$REAL_IF" -m state --state NEW -m set ! --match-set whitelist src -j DROP 2>/dev/null
+               iptables -I FORWARD -i "$REAL_IF" -m state --state NEW -m set ! --match-set whitelist src -j DROP
+               echo "$(date '+%Y-%m-%d %H:%M'): Включено вручную ($COUNTRIES)" >> /var/log/vps_geoip.log
+               echo "✅ GeoIP фильтр включен."
+               ;;
+            5)
+               sed -i '/-m recent/d' "$UP_SCRIPT"
+               iptables -F FORWARD
+               bash "$UP_SCRIPT"
+               rm -f /proc/net/xt_recent/* 2>/dev/null
+               echo "✅ Защита портов ПОЛНОСТЬЮ снята." ;;
             6)
-			
-           UP_SCRIPT="/etc/wireguard/up.sh"
-           REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
-           iptables -D FORWARD -i "$REAL_IF" -m state --state NEW -m set ! --match-set whitelist src -j DROP 2>/dev/null
-           ipset destroy whitelist 2>/dev/null
-           rm -f /etc/ipset/whitelist.conf
-           sed -i '/if \[ -s .*whitelist.* \]/,/fi/d' "$UP_SCRIPT"
-           sed -i '/match-set whitelist/d' "$UP_SCRIPT"
-           sed -i '/ipset restore/d' "$UP_SCRIPT"
-           sed -i '/# GeoIP_Countries/d' "$UP_SCRIPT"
-           echo "✅ GeoIP полностью отключен." 
-           ;;
+               REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
+               iptables -D FORWARD -i "$REAL_IF" -m state --state NEW -m set ! --match-set whitelist src -j DROP 2>/dev/null
+               ipset destroy whitelist 2>/dev/null
+               rm -f /etc/ipset/whitelist.conf
+               sed -i '/if \[ -s .*whitelist.* \]/,/fi/d' "$UP_SCRIPT"
+               sed -i '/match-set whitelist/d' "$UP_SCRIPT"
+               sed -i '/ipset restore/d' "$UP_SCRIPT"
+               sed -i '/# GeoIP_Countries/d' "$UP_SCRIPT"
+               echo "✅ GeoIP полностью отключен."
+               ;;
             7)
-                          while true; do
+               while true; do
                    clear
                    echo -e "=== 🔑 УПРАВЛЕНИЕ SSH КЛЮЧАМИ ==="
                    echo "1) 🆕 Сгенерировать новый ключ"
-                   echo "2) 📋 Tаблицa ключей ssh (SFTP пути)"
+                   echo "2) 📋 Таблица ключей ssh (SFTP пути)"
                    echo "3) 📤 Экспорт приватного ключа в консоль"
                    echo "0) 🔙 Назад"
                    read -p "Выбор: " K_OPT
@@ -321,33 +388,36 @@ EOF
                    esac
                    read -p "Enter..." temp
                done ;;
-8) echo "Автообновление GeoIP (Пн, 03:00):"
+            8) echo "Автообновление GeoIP (Пн, 03:00):"
                echo "1) Включить"
                echo "2) Выключить"
+               echo "3) Запустить обновление прямо сейчас"
                read -p "Выбор: " G_OPT
                CRON_JOB="0 3 * * 1 /usr/local/bin/vps update_geoip > /dev/null 2>&1"
-               
+
                if [ "$G_OPT" == "1" ]; then
                    (crontab -l 2>/dev/null | grep -v "update_geoip"; echo "$CRON_JOB") | crontab -
                    echo "✅ Автообновление в расписание добавлено."
                elif [ "$G_OPT" == "2" ]; then
                    crontab -l 2>/dev/null | grep -v "update_geoip" | crontab -
                    echo "❌ Автообновление отключено."
+               elif [ "$G_OPT" == "3" ]; then
+                   /usr/local/bin/vps update_geoip
+                   echo "✅ Обновление выполнено. Лог: $(tail -n 1 /var/log/vps_geoip.log 2>/dev/null)"
                fi ;;
-9) 
+            9)
                echo -e "\n\e[1;34m=== 🚑 СПИСОК НАРУШИТЕЛЕЙ (Последние 20) ===\e[0m"
                if [ ! -d /proc/net/xt_recent ] || [ -z "$(ls -A /proc/net/xt_recent/ 2>/dev/null)" ]; then
                    echo "✅ Списки банов пусты или модуль не активен."
                    read -p "Enter..." temp; continue
                fi
-			   
+
                FOUND_ANY=0
                for file in /proc/net/xt_recent/*; do
                    [ -e "$file" ] || continue
                    list_name=$(basename "$file")
-                   
                    BANNED_IPS=$(grep "src=" "$file" | tail -n 20 | awk -F'src=' '{print $2}' | awk '{print $1}')
-                   
+
                    if [ -n "$BANNED_IPS" ]; then
                        echo -e "\e[1;33mСписок $list_name (показаны последние):\e[0m"
                        echo "$BANNED_IPS" | while read ip; do
@@ -363,7 +433,7 @@ EOF
                    echo "--------------------------------"
                    echo -e "Совет: Чтобы разбанить всех сразу, используйте пункт меню '5' (Выкл/Вкл защиты)."
                    read -p "Введите IP для точечного разбана: " UNBAN_IP
-                   
+
                    if [ -n "$UNBAN_IP" ]; then
                        UNBANNED_COUNT=0
                        for file in /proc/net/xt_recent/*; do
@@ -373,29 +443,31 @@ EOF
                                UNBANNED_COUNT=1
                            fi
                        done
-                       
+
                        if [ "$UNBANNED_COUNT" -eq 0 ]; then
                            echo "⚠️ IP $UNBAN_IP не найден в списках."
                        fi
                    fi
                fi
                ;;
-			   10)
+            10)
                if [ ! -f "$UP_SCRIPT" ]; then
                    echo "❌ Файл $UP_SCRIPT не найден! Сначала выполните установку."
                elif grep -qE "^iptables.*-A POSTROUTING.*-o wg0 -j MASQUERADE" "$UP_SCRIPT"; then
-                   sed -i '/-A POSTROUTING.*-o wg0 -j MASQUERADE/d' "$UP_SCRIPT"
-                   systemctl restart wg-quick@wg0
-                   echo -e "✅ Реальные IP \e[1;32mВКЛЮЧЕНЫ\e[0m (MASQUERADE на wg0 удален)."
+                   sed -i '/-o wg0 -j MASQUERADE/d' "$UP_SCRIPT"
+                   # Удаляем правило на лету без рестарта wg0
+                   while iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null; do :; done
+                   VPN_SUB=$(grep "^Address" "$WG_CONF" 2>/dev/null | awk '{print $3}' | head -1 | sed 's/\.[0-9]*\//.0\//')
+                   [ -n "$VPN_SUB" ] && while iptables -t nat -D POSTROUTING -d "$VPN_SUB" -o wg0 -j MASQUERADE 2>/dev/null; do :; done
+                   echo -e "✅ Реальные IP \e[1;32mВКЛЮЧЕНЫ\e[0m (MASQUERADE на wg0 удален без разрыва связи)."
                else
                    sed -i '/^exit 0/d' "$UP_SCRIPT"
                    echo "iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE" >> "$UP_SCRIPT"
                    echo "exit 0" >> "$UP_SCRIPT"
-                   systemctl restart wg-quick@wg0
+                   iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
                    echo -e "⚠️ Реальные IP \e[1;31mВЫКЛЮЧЕНЫ\e[0m (включен MASQUERADE на wg0)."
                fi
                ;;
-            0) return ;;
             0) return ;;
         esac
         read -p "Enter..." temp
@@ -406,12 +478,12 @@ EOF
 apply_mirror_limit() {
     local NAME=$1; local IP=$2; local SPEED=$3
     if [ -z "$IP" ]; then echo "Error: No IP"; return 1; fi
-    local ID_CLASS=$(echo $IP | cut -d. -f4)
-    sed -i "/# Client:$NAME/d" $UP_SCRIPT
-    sed -i '/^exit 0/d' $UP_SCRIPT
+    local ID_CLASS=$(echo "$IP" | cut -d. -f4)
+    sed -i "/# Client:$NAME/d" "$UP_SCRIPT"
+    sed -i '/^exit 0/d' "$UP_SCRIPT"
     if [ "$SPEED" == "0" ]; then
-        echo "exit 0" >> $UP_SCRIPT
-        bash $UP_SCRIPT >/dev/null 2>&1
+        echo "exit 0" >> "$UP_SCRIPT"
+        bash "$UP_SCRIPT" >/dev/null 2>&1
         return 0
     fi
 
@@ -421,7 +493,7 @@ apply_mirror_limit() {
         BURST="300k"
     fi
 
-    cat <<EOF >> $UP_SCRIPT
+    cat <<EOF >> "$UP_SCRIPT"
 tc class add dev wg0 parent 1:1 classid 1:$ID_CLASS htb rate ${SPEED}mbit ceil ${SPEED}mbit burst ${BURST} cburst ${BURST} prio 1 # Client:$NAME
 tc filter add dev wg0 protocol ip parent 1:0 prio 1 u32 match ip dst $IP flowid 1:$ID_CLASS # Client:$NAME
 
@@ -429,9 +501,8 @@ tc class add dev ifb0 parent 1:1 classid 1:$ID_CLASS htb rate ${SPEED}mbit ceil 
 tc filter add dev ifb0 protocol ip parent 1:0 prio 1 u32 match ip src $IP flowid 1:$ID_CLASS # Client:$NAME
 EOF
 
-    echo "exit 0" >> $UP_SCRIPT
-    
-    bash $UP_SCRIPT >/dev/null 2>&1
+    echo "exit 0" >> "$UP_SCRIPT"
+    bash "$UP_SCRIPT" >/dev/null 2>&1
 }
 
 full_setup() {
@@ -451,7 +522,7 @@ full_setup() {
             5) WG_SUBNET="192.168.10.0/24" ;; 
             *) WG_SUBNET="10.252.1.0/24" ;;
         esac
-        WG_BASE=$(echo $WG_SUBNET | cut -d. -f1-3)
+        WG_BASE=$(echo "$WG_SUBNET" | cut -d. -f1-3)
         if ip route | grep -v "wg0" | grep -q "$WG_BASE"; then
             echo -e "\e[1;31m⚠️ ОШИБКА: Конфликт подсети! Выберите другую.\e[0m"
             continue
@@ -474,7 +545,7 @@ full_setup() {
 
     echo -e "\n📦 Установка необходимых компонентов..."
     apt-get update -y && apt-get install -y ufw wireguard fail2ban qrencode curl jq iptables iproute2 ipset
-	
+
     echo "options xt_recent ip_list_tot=15000" > /etc/modprobe.d/xt_recent.conf
     modprobe -r xt_recent 2>/dev/null
     modprobe xt_recent ip_list_tot=15000 2>/dev/null
@@ -492,13 +563,12 @@ backend = %(sshd_backend)s
 EOF
     systemctl enable fail2ban >/dev/null 2>&1
     systemctl restart fail2ban
-    # -------------------------------------------------------
-    
-   if sshd -t; then
+
+    if sshd -t; then
         systemctl stop ssh.socket > /dev/null 2>&1
         systemctl disable ssh.socket > /dev/null 2>&1
         systemctl daemon-reload
-        systemctl enable ssh || systemctl enable sshd    
+        systemctl enable ssh || systemctl enable sshd
         systemctl restart ssh || systemctl restart sshd
     fi
 
@@ -514,38 +584,29 @@ EOF
 
     SERVER_IP="${WG_BASE}.1"
     ROUTER_IP="${WG_BASE}.2"
-    
-    cat <<EOF > $UP_SCRIPT
+
+    cat <<EOF > "$UP_SCRIPT"
 #!/bin/bash
 # 1. ЯДРО
 sysctl -w net.ipv4.ip_forward=1
 
 # 2. ОЧИСТКА ПРАВИЛ
-# Сначала пытаемся удалить старые правила. Ошибки игнорируем (2>/dev/null)
 iptables -t nat -D POSTROUTING -s $WG_SUBNET -o $REAL_IF -j MASQUERADE 2>/dev/null || true
-iptables -t nat -D POSTROUTING -d $WG_SUBNET -o wg0 -j MASQUERADE 2>/dev/null || true
 
 # Сброс шейпера
 tc qdisc del dev wg0 root 2>/dev/null || true
 tc qdisc del dev ifb0 root 2>/dev/null || true
 ip link delete ifb0 2>/dev/null || true
 
-# 3.NAT
+# 3. NAT (без MASQUERADE на wg0 для сохранения реальных IP клиентов)
 iptables -t nat -A POSTROUTING -s $WG_SUBNET -o $REAL_IF -j MASQUERADE
-iptables -t nat -A POSTROUTING -d $WG_SUBNET -o wg0 -j MASQUERADE
 iptables -A FORWARD -i wg0 -j ACCEPT
 iptables -A FORWARD -o wg0 -j ACCEPT
 
-# 1. Загрузка модуля
+# 4. IFB и шейпер
 modprobe ifb numifbs=1 2>/dev/null
-
-# 2. Удаление старого интерфейса
 ip link delete ifb0 2>/dev/null || true
-
-# 3. Новый интерфейс
 ip link add name ifb0 type ifb 2>/dev/null || true
-
-# 4. Включаем интерфейс
 ip link set dev ifb0 up 2>/dev/null
 
 tc qdisc add dev wg0 handle ffff: ingress 2>/dev/null
@@ -563,32 +624,21 @@ tc class add dev wg0 parent 1:1 classid 1:10 htb rate 1000mbit ceil 1000mbit pri
 tc class add dev ifb0 parent 1:1 classid 1:10 htb rate 1000mbit ceil 1000mbit prio 0 2>/dev/null
 
 EOF
-    chmod +x $UP_SCRIPT
 
     if [ -n "$USER_PORTS" ]; then
         for port in $USER_PORTS; do
             ufw allow "$port"
-            echo "iptables -t nat -D PREROUTING -i $REAL_IF -p tcp --dport $port -j DNAT --to-destination $ROUTER_IP:$port 2>/dev/null || true" >> $UP_SCRIPT
-            echo "iptables -t nat -D PREROUTING -i $REAL_IF -p udp --dport $port -j DNAT --to-destination $ROUTER_IP:$port 2>/dev/null || true" >> $UP_SCRIPT
-            
-            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $port -j DNAT --to-destination $ROUTER_IP:$port # Port:$port" >> $UP_SCRIPT
-            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $port -j DNAT --to-destination $ROUTER_IP:$port # Port:$port" >> $UP_SCRIPT
+            echo "iptables -t nat -D PREROUTING -i $REAL_IF -p tcp --dport $port -j DNAT --to-destination $ROUTER_IP:$port 2>/dev/null || true" >> "$UP_SCRIPT"
+            echo "iptables -t nat -D PREROUTING -i $REAL_IF -p udp --dport $port -j DNAT --to-destination $ROUTER_IP:$port 2>/dev/null || true" >> "$UP_SCRIPT"
+            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $port -j DNAT --to-destination $ROUTER_IP:$port # Port:$port" >> "$UP_SCRIPT"
+            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $port -j DNAT --to-destination $ROUTER_IP:$port # Port:$port" >> "$UP_SCRIPT"
         done
     fi
-    echo "exit 0" >> $UP_SCRIPT
-    chmod +x $UP_SCRIPT
-    if [ -n "$USER_PORTS" ]; then
-        for port in $USER_PORTS; do
-            ufw allow "$port"
-            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $port -j DNAT --to-destination $ROUTER_IP:$port # Port:$port" >> $UP_SCRIPT
-            echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $port -j DNAT --to-destination $ROUTER_IP:$port # Port:$port" >> $UP_SCRIPT
-        done
-    fi
-    echo "exit 0" >> $UP_SCRIPT
-    chmod +x $UP_SCRIPT
+    echo "exit 0" >> "$UP_SCRIPT"
+    chmod +x "$UP_SCRIPT"
 
     SERVER_PRIV=$(wg genkey); SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
-    cat <<EOF > $WG_CONF
+    cat <<EOF > "$WG_CONF"
 [Interface]
 Address = $SERVER_IP/24
 ListenPort = $WG_PORT
@@ -599,7 +649,7 @@ EOF
 
     echo "Создаем клиента Router ($ROUTER_IP)..."
     generate_peer_config "Router" "$ROUTER_IP" "$USER_DNS" "$SERVER_PUB" "true"
-    
+
     systemctl enable wg-quick@wg0 && systemctl restart wg-quick@wg0
 
     clear
@@ -626,7 +676,7 @@ print_web_table() {
     local URL=$1
     local USER=$2
     local PASS=$3
-    local MODE=$4 
+    local MODE=$4
     local PORT=$5
     local IP=$6
 
@@ -637,7 +687,7 @@ print_web_table() {
     echo -e "${green}╟────────────────┼──────────────────────────────────────╢${plain}"
     printf "${green}║${plain} %-14s ${green}│${plain} \033[1;33m%-36s\033[0m ${green}║${plain}\n" "👤 ЛОГИН" "$USER"
     printf "${green}║${plain} %-14s ${green}│${plain} \033[1;33m%-36s\033[0m ${green}║${plain}\n" "🔑 ПАРОЛЬ" "$PASS"
-    
+
     if [ "$MODE" == "LOCAL" ]; then
     echo -e "${green}╠════════════════╧══════════════════════════════════════╣${plain}"
     echo -e "${green}║${plain} 🚇 \033[1;34mSSH ТУННЕЛЬ (Выполнить на своем ПК):\033[0m               ${green}║${plain}"
@@ -657,16 +707,20 @@ apply_ttyd_cert() {
     fi
 
     echo -e "${green}Применяем сертификат ($TYPE) к панели...${plain}"
-    
+
     W_PORT=$(grep "ExecStart" /etc/systemd/system/ttyd.service 2>/dev/null | grep -oP '(?<=-p )\d+')
     W_PORT=${W_PORT:-17681}
-    
+
+    # Сохраняем текущие логин и пароль вместо сброса на admin:admin
+    CUR_CREDS=$(grep "ExecStart" /etc/systemd/system/ttyd.service 2>/dev/null | grep -oP '(?<=-c ")[^"]+')
+    CUR_CREDS=${CUR_CREDS:-admin:admin}
+
     cat <<EOF > /etc/systemd/system/ttyd.service
 [Unit]
 Description=Web SSH Service
 After=network.target
 [Service]
-ExecStart=/usr/bin/ttyd -i 0.0.0.0 -p $W_PORT -W -c "admin:admin" -S -C $CERT_PATH -K $KEY_PATH /bin/bash /usr/local/bin/vps
+ExecStart=/usr/bin/ttyd -i 0.0.0.0 -p $W_PORT -W -c "$CUR_CREDS" -S -C $CERT_PATH -K $KEY_PATH /bin/bash /usr/local/bin/vps
 Restart=always
 User=root
 WorkingDirectory=/root
@@ -676,14 +730,13 @@ EOF
 
     systemctl daemon-reload
     systemctl restart ttyd
-    
-    # ИСПРАВЛЕНИЕ ЗДЕСЬ (-4)
+
     EXT_IP=$(curl -4 -s ifconfig.me)
-    
+
     echo -e "\n${green}✅ СЕРТИФИКАТ ($TYPE) УСПЕШНО ПРИМЕНЕН!${plain}"
     echo "---------------------------------------------------"
     if [ "$TYPE" == "domain" ]; then
-        DOM=$(openssl x509 -noout -subject -in $CERT_PATH | sed -n 's/^.*CN = \(.*\)$/\1/p')
+        DOM=$(openssl x509 -noout -subject -in "$CERT_PATH" | sed -n 's/^.*CN = \(.*\)$/\1/p')
         echo -e "🌍 Внешняя ссылка:   ${green}https://$DOM:$W_PORT${plain}"
     else
         echo -e "🌍 Внешняя ссылка:   ${green}https://$EXT_IP:$W_PORT${plain}"
@@ -697,10 +750,9 @@ EOF
 }
 
 setup_acme_ip() {
-    # --- ИСПРАВЛЕНИЕ: Добавлен флаг -4 для получения IPv4 ---
     local IP=$(curl -4 -s ifconfig.me)
     echo -e "${green}Получаем SSL для IP: $IP ...${plain}"
-    
+
     if ! command -v socat >/dev/null 2>&1; then apt-get install -y socat >/dev/null; fi
     if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then curl -s https://get.acme.sh | sh >/dev/null 2>&1; fi
 
@@ -718,7 +770,7 @@ setup_acme_ip() {
             --key-file /root/cert/ip/privkey.pem \
             --fullchain-file /root/cert/ip/fullchain.pem \
             --reloadcmd "systemctl restart ttyd"
-            
+
         chmod 600 /root/cert/ip/privkey.pem
         apply_ttyd_cert "ip"
     else
@@ -747,7 +799,7 @@ setup_acme_domain() {
             --key-file /root/cert/domain/privkey.pem \
             --fullchain-file /root/cert/domain/fullchain.pem \
             --reloadcmd "systemctl restart ttyd"
-            
+
         chmod 600 /root/cert/domain/privkey.pem
         apply_ttyd_cert "domain"
     else
@@ -756,7 +808,6 @@ setup_acme_domain() {
 }
 
 manage_web_panel() {
-
     if ! command -v wget >/dev/null 2>&1; then
         echo -e "\e[1;33m⚠️ Утилита wget не найдена. Устанавливаем...\e[0m"
         apt-get update -y >/dev/null 2>&1 && apt-get install -y wget >/dev/null 2>&1
@@ -782,19 +833,19 @@ manage_web_panel() {
         if systemctl is-active --quiet ttyd; then
             ST_WEB="${green}ВКЛ${plain}"
             SERV_FILE="/etc/systemd/system/ttyd.service"
-            CUR_PORT=$(grep "ExecStart" $SERV_FILE 2>/dev/null | grep -oP '(?<=-p )\d+')
-            CREDS=$(grep "ExecStart" $SERV_FILE 2>/dev/null | grep -oP '(?<=-c ")[^"]+')
-            CUR_USER=$(echo $CREDS | cut -d: -f1)
-            CUR_PASS=$(echo $CREDS | cut -d: -f2)
-            if grep -q "\-i 127.0.0.1" $SERV_FILE; then
+            CUR_PORT=$(grep "ExecStart" "$SERV_FILE" 2>/dev/null | grep -oP '(?<=-p )\d+')
+            CREDS=$(grep "ExecStart" "$SERV_FILE" 2>/dev/null | grep -oP '(?<=-c ")[^"]+')
+            CUR_USER=$(echo "$CREDS" | cut -d: -f1)
+            CUR_PASS=$(echo "$CREDS" | cut -d: -f2)
+            if grep -q "\-i 127.0.0.1" "$SERV_FILE"; then
                 MODE_TEXT="🔒 LOCAL (Только туннель)"
                 IS_LOCAL=1
             else
                 MODE_TEXT="🌍 PUBLIC (Интернет)"
                 IS_LOCAL=0
             fi
-            
-            if grep -q "\-C /root/cert" $SERV_FILE; then
+
+            if grep -q "\-C /root/cert" "$SERV_FILE"; then
                 SSL_TEXT="${green}SSL АКТИВЕН${plain}"
                 PROTO="https"
             else
@@ -806,7 +857,7 @@ manage_web_panel() {
             SSL_TEXT=""
             MODE_TEXT=""
         fi
-        
+
         echo -e "=== 🌐 WEB-ПАНЕЛЬ [ $ST_WEB ] ==="
         if [ -n "$MODE_TEXT" ]; then
             echo -e "   Режим:  $MODE_TEXT"
@@ -830,12 +881,12 @@ manage_web_panel() {
         else
              echo -e "1) 🚀 ВКЛЮЧИТЬ панель"
         fi
-        
+
         echo "0) 🔙 Назад"
         read -p "Выбор: " W_OPT
 
         case $W_OPT in
-            1) 
+            1)
                 if systemctl is-active --quiet ttyd; then
                     systemctl stop ttyd && systemctl disable ttyd
                     [ -n "$CUR_PORT" ] && ufw delete allow "$CUR_PORT/tcp" > /dev/null 2>&1
@@ -845,11 +896,11 @@ manage_web_panel() {
                     echo "1) 🔒 ЛОКАЛЬНО (127.0.0.1) - Безопасно, вход через SSH-туннель. SSL не нужен."
                     echo "2) 🌍 ПУБЛИЧНО (0.0.0.0)   - Доступ из интернета. Рекомендуется SSL."
                     read -p "Выберите режим [1]: " MODE_OPT
-                    
+
                     read -p "Придумайте Логин [admin]: " WU; WU=${WU:-admin}
                     read -p "Придумайте Пароль [admin]: " WP; WP=${WP:-admin}
                     read -p "Порт панели [17681]: " W_PORT; W_PORT=${W_PORT:-17681}
-                    
+
                     if [ "$MODE_OPT" == "2" ]; then
                         IP_BIND="0.0.0.0"
                         read -p "Включить SSL сразу? (y/n) [n]: " WANT_SSL
@@ -886,19 +937,19 @@ WantedBy=multi-user.target
 EOF
                     systemctl daemon-reload; systemctl enable ttyd; systemctl restart ttyd
                     echo -e "\n${green}✅ УСПЕШНО ЗАПУЩЕНО!${plain}"
-                fi 
+                fi
                 ;;
-            2) systemctl restart ttyd; echo "Перезапущено.";;
-            3) 
+            2) systemctl restart ttyd; echo "Перезапущено." ;;
+            3)
                 echo -e "\n1) Получить SSL на IP\n2) Получить SSL на Домен\n3) Применить к панели"
                 read -p "Выбор: " SSL_SUB
                 case $SSL_SUB in
                     1) setup_acme_ip ;;
                     2) setup_acme_domain ;;
-                    3) 
-                       if [ -f "/root/cert/ip/fullchain.pem" ]; then apply_ttyd_cert "ip"; 
-                       elif [ -f "/root/cert/domain/fullchain.pem" ]; then apply_ttyd_cert "domain"; 
-                       else echo "${red}Сертификатов нет${plain}"; fi ;;
+                    3)
+                       if [ -f "/root/cert/ip/fullchain.pem" ]; then apply_ttyd_cert "ip";
+                       elif [ -f "/root/cert/domain/fullchain.pem" ]; then apply_ttyd_cert "domain";
+                       else echo -e "${red}Сертификатов нет${plain}"; fi ;;
                 esac
                 ;;
             0) break ;;
@@ -911,7 +962,6 @@ manage_bot() {
     BOT_SERVICE="/etc/systemd/system/tgbot.service"
     CFG_FILE="/root/.tg_config"
 
-   
     load_creds() {
         if [ -f "$CFG_FILE" ]; then
             source "$CFG_FILE"
@@ -922,15 +972,13 @@ manage_bot() {
         load_creds
         clear
         echo -e "\e[1;36m=== 🤖 УПРАВЛЕНИЕ БОТОМ ===\e[0m"
-        
-       
+
         if systemctl is-active --quiet tgbot; then
             echo -e "Статус: \e[1;32m✅ РАБОТАЕТ\e[0m"
         else
             echo -e "Статус: \e[1;31m🛑 ОСТАНОВЛЕН\e[0m"
         fi
-        
-		
+
         if [ -n "$TOKEN" ]; then
             echo -e "Данные: \e[1;33mСОХРАНЕНЫ\e[0m (ID: $ADMIN_ID)"
         else
@@ -949,7 +997,7 @@ manage_bot() {
         read -p "Выбор: " B_OPT
 
         case $B_OPT in
-            1) 
+            1)
                 if [ -n "$TOKEN" ] && [ -n "$ADMIN_ID" ]; then
                     echo "Используем сохраненные данные..."
                     install_bot_logic "$TOKEN" "$ADMIN_ID"
@@ -960,24 +1008,22 @@ manage_bot() {
                     install_bot_logic "$TOKEN" "$ADMIN_ID"
                 fi
                 read -p "Готово. Enter..." ;;
-            
-            2) 
+            2)
                 echo "Введите новые данные:"
                 read -p "Новый Token: " TOKEN
                 read -p "Новый Admin ID: " ADMIN_ID
                 install_bot_logic "$TOKEN" "$ADMIN_ID"
                 read -p "Данные обновлены. Enter..." ;;
-            
             3) systemctl restart tgbot; echo "Рестарт..."; sleep 1 ;;
             4) systemctl stop tgbot; echo "Стоп."; sleep 1 ;;
             5) journalctl -u tgbot -n 30 --no-pager; read -p "Enter..." ;;
-            6) 
+            6)
                 systemctl stop tgbot
                 systemctl disable tgbot
-                rm /etc/systemd/system/tgbot.service
-                rm /root/.tg_config
+                rm -f /etc/systemd/system/tgbot.service
+                rm -f /root/.tg_config
                 rm -rf /root/scripts
-                rm /root/tg_bot.py
+                rm -f /root/tg_bot.py
                 systemctl daemon-reload
                 echo "Бот удален."
                 sleep 2 ;;
@@ -989,36 +1035,35 @@ manage_bot() {
 install_bot_logic() {
     local TOKEN="$1"
     local ID="$2"
-    
+
     echo "TOKEN=\"$TOKEN\"" > /root/.tg_config
     echo "ADMIN_ID=\"$ID\"" >> /root/.tg_config
-    
+
     echo "🏗 Установка бота..."
-    
+
     systemctl stop tgbot 2>/dev/null
-    pkill -9 python3 2>/dev/null
-    
+    pkill -f "/root/tg_bot.py" 2>/dev/null || true
+
     echo "📦 Установка библиотек (может занять до 5 минут)..."
     apt-get update -y >/dev/null 2>&1
     apt-get install -y ipset curl geoip-bin iproute2 ufw wireguard qrencode jq python3-pip >/dev/null 2>&1
-    
+
     pip3 install pyTelegramBotAPI --break-system-packages 2>/dev/null || pip3 install pyTelegramBotAPI
-    
+
     mkdir -p /root/scripts /etc/ipset /root/wg_clients /etc/wireguard/ssh_key /root/.ssh
     chmod 700 /root/.ssh
     touch /root/.ssh/authorized_keys
     chmod 600 /root/.ssh/authorized_keys
-    
     touch /etc/ipset/whitelist.conf
 
     UP_SCRIPT="/etc/wireguard/up.sh"
-    
+
     modprobe ifb numifbs=1 2>/dev/null
     grep -q "ifb" /etc/modules || echo "ifb" >> /etc/modules
-    
 
-
-    cat <<'EOF' > "$UP_SCRIPT"
+    # Создаем up.sh только если он еще не существует (чтобы не затирать порты и лимиты!)
+    if [ ! -f "$UP_SCRIPT" ]; then
+        cat <<'EOF' > "$UP_SCRIPT"
 #!/bin/bash
 # 1. Ядро
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
@@ -1029,8 +1074,7 @@ iptables -t nat -F POSTROUTING
 iptables -t nat -F PREROUTING
 iptables -F FORWARD
 
-# 3. NAT
-iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+# 3. NAT (без MASQUERADE на wg0 для сохранения реальных IP клиентов)
 iptables -t nat -A POSTROUTING -o $DEV -j MASQUERADE
 
 # 4. Forwarding
@@ -1040,27 +1084,21 @@ iptables -A FORWARD -i $DEV -o wg0 -j ACCEPT
 iptables -A FORWARD -i wg0 -o $DEV -j ACCEPT
 
 # 5. IFB
-# модуль
 modprobe ifb numifbs=1 >/dev/null 2>&1 || true
-
-# Удаление старого интерфейса
 ip link delete ifb0 2>/dev/null || true
 ip link add name ifb0 type ifb 2>/dev/null || true
 ip link set dev ifb0 up >/dev/null 2>&1 || true
 
-# Сброс очередей
 tc qdisc del dev wg0 root >/dev/null 2>&1 || true
 tc qdisc del dev ifb0 root >/dev/null 2>&1 || true
 tc qdisc del dev wg0 ingress >/dev/null 2>&1 || true
 
-# Корневые правила (1 Gbit)
 tc qdisc add dev wg0 root handle 1: htb default 1 >/dev/null 2>&1 || true
 tc class add dev wg0 parent 1: classid 1:1 htb rate 1000mbit >/dev/null 2>&1 || true
 
 tc qdisc add dev ifb0 root handle 1: htb default 1 >/dev/null 2>&1 || true
 tc class add dev ifb0 parent 1: classid 1:1 htb rate 1000mbit >/dev/null 2>&1 || true
 
-# Upload Limit
 tc qdisc add dev wg0 handle ffff: ingress >/dev/null 2>&1 || true
 tc filter add dev wg0 parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0 >/dev/null 2>&1 || true
 
@@ -1072,33 +1110,28 @@ fi
 
 exit 0
 EOF
-    chmod +x "$UP_SCRIPT"
+        chmod +x "$UP_SCRIPT"
+        bash "$UP_SCRIPT"
+    fi
 
-
-
- cat <<'EOF' > /root/scripts/geoip_on.sh
+    cat <<'EOF' > /root/scripts/geoip_on.sh
 #!/bin/bash
 COUNTRIES=$1
 UP_SCRIPT="/etc/wireguard/up.sh"
 IPSET_FILE="/etc/ipset/whitelist.conf"
 REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
 [ -z "$COUNTRIES" ] && echo "EMPTY" && exit 1
-iptables -D FORWARD -i $REAL_IF -m state --state NEW -m set ! --match-set whitelist src -j DROP 2>/dev/null
+iptables -D FORWARD -i "$REAL_IF" -m state --state NEW -m set ! --match-set whitelist src -j DROP 2>/dev/null
 ipset destroy whitelist 2>/dev/null
 ipset create whitelist hash:net -!
-# Новые списки стран
 for country in $COUNTRIES; do
-    # Перевод в нижний регистр (RU -> ru)
     c=$(echo "$country" | tr '[:upper:]' '[:lower:]')
-    
     if curl -s -f "http://www.ipdeny.com/ipblocks/data/countries/$c.zone" > /tmp/cnt.zone; then
         while read -r line; do ipset add whitelist "$line" -! 2>/dev/null; done < /tmp/cnt.zone
     fi
 done
 ipset save whitelist > "$IPSET_FILE"
-# 3. up.sh
 sed -i '/if \[ -s .*whitelist.* \]/,/fi/d' "$UP_SCRIPT"
-# Мусор
 sed -i '/match-set whitelist/d' "$UP_SCRIPT"
 sed -i '/# GeoIP_Countries/d' "$UP_SCRIPT"
 sed -i '/ipset restore/d' "$UP_SCRIPT"
@@ -1107,17 +1140,16 @@ echo "# GeoIP_Countries: $COUNTRIES" >> "$UP_SCRIPT"
 cat <<CMD >> "$UP_SCRIPT"
 if [ -s /etc/ipset/whitelist.conf ]; then
     ipset restore -! < /etc/ipset/whitelist.conf 2>/dev/null || true
-    iptables -I FORWARD -i \$DEV -m state --state NEW -m set ! --match-set whitelist src -j DROP 2>/dev/null || true
+    iptables -I FORWARD -i $REAL_IF -m state --state NEW -m set ! --match-set whitelist src -j DROP 2>/dev/null || true
 fi
 CMD
 echo "exit 0" >> "$UP_SCRIPT"
-iptables -I FORWARD -i $REAL_IF -m state --state NEW -m set ! --match-set whitelist src -j DROP
+iptables -I FORWARD -i "$REAL_IF" -m state --state NEW -m set ! --match-set whitelist src -j DROP
 echo "DONE"
 EOF
-chmod +x /root/scripts/geoip_on.sh
+    chmod +x /root/scripts/geoip_on.sh
 
-
-   cat <<'EOF' > /root/scripts/geoip_off.sh
+    cat <<'EOF' > /root/scripts/geoip_off.sh
 #!/bin/bash
 UP_SCRIPT="/etc/wireguard/up.sh"
 REAL_IF=$(ip -4 route show default | awk '/default/ {print $5}')
@@ -1130,13 +1162,10 @@ sed -i '/match-set whitelist/d' "$UP_SCRIPT"
 sed -i '/ipset restore/d' "$UP_SCRIPT"
 echo "OFF"
 EOF
-chmod +x /root/scripts/geoip_off.sh
-	
-	
-	
+    chmod +x /root/scripts/geoip_off.sh
+
     cat <<'EOF' > /root/scripts/monitor.sh
 #!/bin/bash
-#токен
 if [ -f /root/.tg_config ]; then source /root/.tg_config; else exit 0; fi
 
 send_msg() {
@@ -1154,7 +1183,7 @@ if ! systemctl is-active --quiet wg-quick@wg0; then
     fi
 fi
 
-#ANTI-FLOOD
+# ANTI-FLOOD
 NOW="/tmp/bans_now.txt"
 PREV="/tmp/bans_prev.txt"
 
@@ -1174,7 +1203,6 @@ cp "$NOW" "$PREV"
 EOF
     chmod +x /root/scripts/monitor.sh
 
-
     cat <<EOF > /etc/systemd/system/vps_monitor.service
 [Unit]
 Description=VPS Watchdog
@@ -1193,13 +1221,11 @@ OnUnitActiveSec=1min
 WantedBy=timers.target
 EOF
 
-    #таймер
     systemctl daemon-reload
     systemctl enable vps_monitor.timer
     systemctl start vps_monitor.timer
-    
 
-   # STATUS.SH
+    # STATUS.SH
     cat <<'EOF' > /root/scripts/status.sh
 #!/bin/bash
 WG_CONF="/etc/wireguard/wg0.conf"
@@ -1213,7 +1239,6 @@ WG_PORT=$(grep "ListenPort" "$WG_CONF" 2>/dev/null | awk '{print $3}')
 SSH_PORT=$(grep "^Port " "$SSH_CONF" 2>/dev/null | awk '{print $2}'); [ -z "$SSH_PORT" ] && SSH_PORT="22"
 
 if grep -q "match-set whitelist" "$UP_SCRIPT" 2>/dev/null; then GEO="✅ ON"; else GEO="❌ OFF"; fi
-
 if systemctl is-active --quiet ttyd; then WEB="🖥 ON"; else WEB="❌ OFF"; fi
 if grep -q "^PasswordAuthentication no" "$SSH_CONF"; then SSH_MODE="🔐 KEY"; else SSH_MODE="🔓 PASS"; fi
 
@@ -1233,17 +1258,16 @@ echo "🚪 Gateway: <code>$GW_IP</code>"
 echo "🕸 VPN Net: <code>$VPN_NET</code>"
 echo "🔌 WG Port: <code>$WG_PORT</code>"
 echo "🛡 SSH: <code>$SSH_PORT</code> ($SSH_MODE)"
-echo "🌍 GeoIP: $GEO |WeB $WEB"
+echo "🌍 GeoIP: $GEO | Web: $WEB"
 echo "🚫 Banned: $(ls /proc/net/xt_recent/ 2>/dev/null | xargs -I {} cat /proc/net/xt_recent/{} 2>/dev/null | wc -l)"
 echo ""
 echo "<b>🔌 ОТКРЫТЫЕ ПОРТЫ:</b>"
 echo "<code>$PORTS_INFO</code>"
 EOF
-   
-   chmod +x /root/scripts/status.sh
+    chmod +x /root/scripts/status.sh
 
-     # speed
- cat <<'EOF' > /root/scripts/set_limit.sh
+    # SET LIMIT
+    cat <<'EOF' > /root/scripts/set_limit.sh
 #!/bin/bash
 NAME=$1; SPEED=$2
 UP_SCRIPT="/etc/wireguard/up.sh"; WG_CONF="/etc/wireguard/wg0.conf"
@@ -1259,12 +1283,12 @@ if [ "$SPEED" -eq 0 ]; then
 fi
 
 if [ "$SPEED" -ge 500 ]; then
-    BURST="1500k"  # Режим "Турбо" (для 500-1000 Мбит)
+    BURST="1500k"
 else
-    BURST="300k"   # Режим "Комфорт" (для < 500 Мбит)
+    BURST="300k"
 fi
 
-ID=$(echo $IP | cut -d. -f4)
+ID=$(echo "$IP" | cut -d. -f4)
 
 cat <<RULES >> "$UP_SCRIPT"
 tc class add dev wg0 parent 1:1 classid 1:$ID htb rate ${SPEED}mbit ceil ${SPEED}mbit burst ${BURST} cburst ${BURST} prio 1 # Client:$NAME
@@ -1275,13 +1299,12 @@ tc filter add dev ifb0 protocol ip parent 1:0 prio 1 u32 match ip src $IP flowid
 RULES
 
 echo "exit 0" >> "$UP_SCRIPT"
-
 bash "$UP_SCRIPT"
 echo "SET"
 EOF
-chmod +x /root/scripts/set_limit.sh
+    chmod +x /root/scripts/set_limit.sh
 
-# ADD PORT
+    # ADD PORT
     cat <<'EOF' > /root/scripts/add_port.sh
 #!/bin/bash
 CLIENT_NAME=$1; PORT=$2
@@ -1319,7 +1342,7 @@ else echo "ERROR"; fi
 EOF
     chmod +x /root/scripts/del_port.sh
 
-    # ADD CLIENT
+    # ADD CLIENT (без разрыва соединений через wg syncconf)
     cat <<'EOF' > /root/scripts/add.sh
 #!/bin/bash
 NAME=$1; [ -z "$NAME" ] && echo "ERROR" && exit 1
@@ -1345,12 +1368,12 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 CFG
 
-systemctl restart wg-quick@wg0
+wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl restart wg-quick@wg0
 echo "SUCCESS|$CLIENT_DIR/$NAME.conf"
 EOF
     chmod +x /root/scripts/add.sh
 
-    # DEL CLIENT
+    # DEL CLIENT (без разрыва соединений через wg syncconf)
     cat <<'EOF' > /root/scripts/del.sh
 #!/bin/bash
 NAME=$1; WG_CONF="/etc/wireguard/wg0.conf"; UP_SCRIPT="/etc/wireguard/up.sh"
@@ -1360,7 +1383,7 @@ if [ -n "$LINE" ]; then
     sed -i "${LINE},$((LINE + 3))d" "$WG_CONF"
     sed -i '/^$/N;/^\n$/D' "$WG_CONF"
     rm -f "/root/wg_clients/$NAME.conf"
-    systemctl restart wg-quick@wg0
+    wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl restart wg-quick@wg0
     echo "SUCCESS"
 else echo "ERROR"; fi
 EOF
@@ -1446,8 +1469,7 @@ systemctl restart ssh; systemctl restart sshd; echo "$STATUS"
 EOF
     chmod +x /root/scripts/ssh_toggle.sh
 
-    # PYTHON
-   
+    # PYTHON BOT
     cat <<EOF > /root/tg_bot.py
 import telebot
 import subprocess
@@ -1497,7 +1519,6 @@ def cancel_op(m): bot.send_message(m.chat.id, "Отменено.", reply_markup=
 def status(m): bot.send_message(m.chat.id, call_script('status.sh'), parse_mode='HTML')
 @bot.message_handler(func=lambda m: m.text == "🛡 Безопасность")
 def sec(m): bot.send_message(m.chat.id, "🛡 Настройки:", reply_markup=security_menu())
-# --- SSH KEYS ---
 @bot.message_handler(func=lambda m: m.text == "🔑 SSH Ключи")
 def keys_main(m): bot.send_message(m.chat.id, "Управление:", reply_markup=keys_menu())
 @bot.message_handler(func=lambda m: m.text == "🆕 Создать Ключ")
@@ -1551,7 +1572,6 @@ def k_del_2(m, items):
     if 0 <= idx < len(items):
         call_script('ssh_keys.sh', 'del', items[idx])
         bot.send_message(m.chat.id, f"✅ Удален: {items[idx]}", reply_markup=keys_menu())
-# SSH TOGGLE
 @bot.message_handler(func=lambda m: m.text == "🔐 Toggle SSH (Key/Pass)")
 def ssh_tog(m):
     bot.send_message(m.chat.id, "⏳ ...")
@@ -1561,8 +1581,6 @@ def ssh_tog(m):
     elif "NO_KEYS" in res: msg = "⛔️ Нет ключей!"
     else: msg = "❌ Ошибка."
     bot.send_message(m.chat.id, msg, reply_markup=security_menu())
-
-#GEOIP
 @bot.message_handler(func=lambda m: m.text == "🌍 GeoIP Меню")
 def geo_m(m):
     mk = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -1582,7 +1600,6 @@ def geo_on_2(m):
 def geo_off(m):
     call_script('geoip_off.sh')
     bot.send_message(m.chat.id, "✅ GeoIP OFF.", reply_markup=security_menu())
-# WG CLIENTS
 @bot.message_handler(func=lambda m: m.text == "👥 Клиенты")
 def clients_show(m):
     res = call_script('clients.sh')
@@ -1612,7 +1629,6 @@ def wg_dl_2(m, items):
             except: pass
     else: bot.send_message(m.chat.id, "Неверно.")
     clients_show(m)
-# USER
 @bot.message_handler(func=lambda m: m.text == "➕ Создать Клиента")
 def add_u(m):
     msg = bot.send_message(m.chat.id, "📝 Имя:", reply_markup=back_menu())
@@ -1643,7 +1659,6 @@ def del_u_2(m, items):
         call_script('del.sh', items[idx])
         bot.send_message(m.chat.id, f"✅ Удален: {items[idx]}")
     bot.send_message(m.chat.id, "Меню", reply_markup=main_menu())
-# LIMITS
 @bot.message_handler(func=lambda m: m.text == "🚀 Лимит скорости")
 def lim_1(m):
     res = call_script('list_limits.sh')
@@ -1669,7 +1684,6 @@ def lim_3(m, name):
     if not m.text.isdigit(): return
     call_script('set_limit.sh', name, m.text)
     bot.send_message(m.chat.id, "✅ Лимит обновлен.", reply_markup=main_menu())
-# PORTS
 @bot.message_handler(func=lambda m: m.text == "🔌 Добавить порт")
 def add_p(m):
     res = call_script('list.sh')
@@ -1706,7 +1720,6 @@ if __name__ == "__main__":
         except: time.sleep(5)
 EOF
 
-
     cat <<EOF > /etc/systemd/system/tgbot.service
 [Unit]
 Description=WG Bot
@@ -1719,12 +1732,70 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-
-    bash /etc/wireguard/up.sh
     systemctl daemon-reload
     systemctl enable tgbot
     systemctl restart tgbot
     echo "✅ Бот установлен."
+}
+
+manage_backup() {
+    BACKUP_DIR="/root/vps_backups"
+    mkdir -p "$BACKUP_DIR"
+
+    while true; do
+        clear
+        echo -e "=== 💾 БЭКАП И ВОССТАНОВЛЕНИЕ ==="
+        echo "1) 📦 Создать резервную копию"
+        echo "2) ♻️ Восстановить из резервной копии"
+        echo "3) 📋 Список бэкапов"
+        echo "0) 🔙 Назад"
+        read -p "Выбор: " BK_OPT
+
+        case $BK_OPT in
+            1)
+                ARCHIVE="$BACKUP_DIR/vps_backup_$(date '+%Y-%m-%d_%H-%M-%S').tar.gz"
+                PATHS=()
+                [ -d /etc/wireguard ] && PATHS+=("/etc/wireguard")
+                [ -d /root/wg_clients ] && PATHS+=("/root/wg_clients")
+                [ -d /etc/ipset ] && PATHS+=("/etc/ipset")
+                [ -f /root/.tg_config ] && PATHS+=("/root/.tg_config")
+
+                if [ ${#PATHS[@]} -eq 0 ]; then
+                    echo "❌ Нет данных для бэкапа."
+                else
+                    tar -czf "$ARCHIVE" "${PATHS[@]}" 2>/dev/null
+                    echo -e "✅ Бэкап создан:\n   \e[1;36m$ARCHIVE\e[0m"
+                fi
+                ;;
+            2)
+                mapfile -t BACKUPS < <(ls -1t "$BACKUP_DIR"/vps_backup_*.tar.gz 2>/dev/null)
+                if [ ${#BACKUPS[@]} -eq 0 ]; then
+                    echo "❌ Бэкапы не найдены в $BACKUP_DIR."
+                else
+                    echo "Доступные бэкапы:"
+                    for idx in "${!BACKUPS[@]}"; do
+                        echo "$((idx + 1))) $(basename "${BACKUPS[$idx]}")"
+                    done
+                    read -p "Введите номер бэкапа для восстановления: " B_NUM
+                    if [[ "$B_NUM" =~ ^[0-9]+$ ]] && [ "$B_NUM" -ge 1 ] && [ "$B_NUM" -le "${#BACKUPS[@]}" ]; then
+                        SEL_ARCH="${BACKUPS[$((B_NUM - 1))]}"
+                        tar -xzf "$SEL_ARCH" -C /
+                        chmod +x "$UP_SCRIPT" 2>/dev/null
+                        systemctl restart wg-quick@wg0 2>/dev/null
+                        echo -e "✅ Восстановлено из \e[1;32m$(basename "$SEL_ARCH")\e[0m и WireGuard перезапущен."
+                    else
+                        echo "❌ Неверный номер."
+                    fi
+                fi
+                ;;
+            3)
+                echo -e "\nФайлы в $BACKUP_DIR:"
+                ls -lh "$BACKUP_DIR"/vps_backup_*.tar.gz 2>/dev/null || echo "Пусто."
+                ;;
+            0) break ;;
+        esac
+        read -p "Enter..." temp
+    done
 }
 
 show_tech_menu() {
@@ -1739,6 +1810,7 @@ show_tech_menu() {
         echo "6) 📱 ПОКАЗАТЬ QR Выбранного Клиента"
         echo "7) 🌀 REBOOT (Перезагрузка всей системы)"
         echo -e "8) 🌐 \e[1;32mУПРАВЛЕНИЕ WEB-ПАНЕЛЬЮ\e[0m"
+        echo -e "9) 💾 \e[1;36mБЭКАП / ВОССТАНОВЛЕНИЕ\e[0m"
         echo "0) 🔙 Назад"
         read -p "Выбор: " T_OPT
 
@@ -1748,26 +1820,28 @@ show_tech_menu() {
             3) systemctl start wg-quick@wg0 && echo "✅ WireGuard запущен." ;;
             4) echo -e "\n\e[1;32m--- Статус WireGuard ---\e[0m"; wg show; echo "------------------------" ;;
             5) echo -e "\n\e[1;33m--- 📂 ОСНОВНЫЕ КОНФИГИ (/etc/wireguard) ---\e[0m"
-                      ls -F /etc/wireguard | grep -v "/"
-                      echo -e "\n\e[1;36m--- 🔑 SSH КЛЮЧИ ($SSH_KEY_DIR) ---\e[0m"
-                      [ -d "$SSH_KEY_DIR" ] && ls -F "$SSH_KEY_DIR" || echo "Папка не найдена"
-                      echo -e "\n\e[1;35m--- 👤 КОНФИГИ КЛИЕНТОВ ($CLIENT_DIR) ---\e[0m"
-                      [ -d "$CLIENT_DIR" ] && ls -F "$CLIENT_DIR" || echo "Папка не найдена"
-                      echo -e "\n\e[1;33m------------------------------------------\e[0m" ;;
-            6) grep -a "# Client:" $WG_CONF | awk '{print $3}'
+               ls -F /etc/wireguard | grep -v "/"
+               echo -e "\n\e[1;36m--- 🔑 SSH КЛЮЧИ ($SSH_KEY_DIR) ---\e[0m"
+               [ -d "$SSH_KEY_DIR" ] && ls -F "$SSH_KEY_DIR" || echo "Папка не найдена"
+               echo -e "\n\e[1;35m--- 👤 КОНФИГИ КЛИЕНТОВ ($CLIENT_DIR) ---\e[0m"
+               [ -d "$CLIENT_DIR" ] && ls -F "$CLIENT_DIR" || echo "Папка не найдена"
+               echo -e "\n\e[1;33m------------------------------------------\e[0m" ;;
+            6) grep -a "# Client:" "$WG_CONF" | awk '{print $3}'
                read -p "Имя юзера для QR: " QN
                [ -f "$CLIENT_DIR/$QN.conf" ] && qrencode -t ansiutf8 < "$CLIENT_DIR/$QN.conf" || echo "❌ Файл не найден!" ;;
             7) read -p "⚠️ ПЕРЕЗАГРУЗИТЬ VPS? (y/n): " CONFIRM
                [ "$CONFIRM" == "y" ] && reboot ;;
             8) manage_web_panel ;;
+            9) manage_backup ;;
             0) break ;;
         esac
         read -p "Enter..." temp
     done
 }
+
 while true; do
     clear; show_infra
-    echo "=== 🛡️ VPS MANAGER v3.0 ==="
+    echo "=== 🛡️ VPS MANAGER v3.1 ==="
     echo -e "1) 🛠 ПОЛНАЯ УСТАНОВКА"
     echo -e "2) 🔐 ЦЕНТР БЕЗОПАСНОСТИ"
     echo -e "3) 🔌 ДОБАВИТЬ ПОРТ"
@@ -1776,14 +1850,14 @@ while true; do
     echo -e "6) 🗑 УДАЛИТЬ КЛИЕНТА"
     echo -e "7) 🏎 ИЗМЕНИТЬ ЛИМИТ СКОРОСТИ"
     echo -e "8) ⚙️ ТЕХ. ОБСЛУЖИВАНИЕ"
-    echo -e "9) 🤖 \e[1;36mТЕЛЕГРАМ БОТ\e[0m"   # <--- НОВЫЙ ПУНКТ
+    echo -e "9) 🤖 \e[1;36mТЕЛЕГРАМ БОТ\e[0m"
     echo "0) 🚪 ВЫХОД"
-    
+
     read -p "Действие: " M
     case $M in
         1) full_setup ;;
         2) manage_security ;;
-        3) 
+        3)
             echo -e "\n\e[1;34m=== 🔌 ПРОБРОС ПОРТОВ (СПИСКОМ) ===\e[0m"
             read -p "Введите порты (через пробел или запятую): " RAW_PORTS
             [ -z "$RAW_PORTS" ] && continue
@@ -1818,215 +1892,214 @@ while true; do
             if [ -z "$TARGET_IP" ]; then
                 echo -e "\e[1;31m❌ Ошибка: Клиент '$T_NAME' не найден!\e[0m"; read -p "Enter..." temp; continue
             fi
-            
+
             echo "🛡 Защита: 1)Стандарт 2)Строго 3)Выкл"; read -p "Выбор [1]: " P_PROT
             case $P_PROT in 2) H=10; S=86400 ;; 3) H=0; S=0 ;; *) H=5; S=60 ;; esac
 
             for N_PORT in $CLEAN_PORTS; do
                 echo -e "⚙️ Обработка порта \e[1;33m$N_PORT\e[0m..."
 
-                if grep -q "dport $N_PORT " $UP_SCRIPT; then
-                    sed -i "/--dport $N_PORT /d" $UP_SCRIPT
-                    sed -i "/name PORT_$N_PORT/d" $UP_SCRIPT
+                if grep -q "dport $N_PORT " "$UP_SCRIPT"; then
+                    sed -i "/--dport $N_PORT /d" "$UP_SCRIPT"
+                    sed -i "/name PORT_$N_PORT/d" "$UP_SCRIPT"
                 fi
 
                 ufw allow "$N_PORT" >/dev/null 2>&1
-                
-                sed -i '/^exit 0/d' $UP_SCRIPT
-                
+                sed -i '/^exit 0/d' "$UP_SCRIPT"
+
                 if [ "$H" -ne 0 ]; then
-                    echo "iptables -I FORWARD -i $REAL_IF -p tcp --dport $N_PORT -m state --state NEW -m recent --set --name PORT_$N_PORT" >> $UP_SCRIPT
-                    echo "iptables -I FORWARD -i $REAL_IF -p tcp --dport $N_PORT -m state --state NEW -m recent --update --seconds $S --hitcount $H --name PORT_$N_PORT -j DROP" >> $UP_SCRIPT
+                    echo "iptables -I FORWARD -i $REAL_IF -p tcp --dport $N_PORT -m state --state NEW -m recent --set --name PORT_$N_PORT" >> "$UP_SCRIPT"
+                    echo "iptables -I FORWARD -i $REAL_IF -p tcp --dport $N_PORT -m state --state NEW -m recent --update --seconds $S --hitcount $H --name PORT_$N_PORT -j DROP" >> "$UP_SCRIPT"
                 fi
-                
-                echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $N_PORT -j DNAT --to-destination $TARGET_IP:$N_PORT # Port:$N_PORT to $T_NAME" >> $UP_SCRIPT
-                echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $N_PORT -j DNAT --to-destination $TARGET_IP:$N_PORT # Port:$N_PORT to $T_NAME" >> $UP_SCRIPT
-                echo "exit 0" >> $UP_SCRIPT
+
+                echo "iptables -t nat -A PREROUTING -i $REAL_IF -p tcp --dport $N_PORT -j DNAT --to-destination $TARGET_IP:$N_PORT # Port:$N_PORT to $T_NAME" >> "$UP_SCRIPT"
+                echo "iptables -t nat -A PREROUTING -i $REAL_IF -p udp --dport $N_PORT -j DNAT --to-destination $TARGET_IP:$N_PORT # Port:$N_PORT to $T_NAME" >> "$UP_SCRIPT"
+                echo "exit 0" >> "$UP_SCRIPT"
             done
 
             systemctl restart wg-quick@wg0
             echo -e "\e[1;32m✅ Все указанные порты проброшены на $T_NAME!\e[0m"
             read -p "Enter..." temp ;;
-        4) 
-           echo -e "\n\e[1;34m=== ❌ УДАЛЕНИЕ ПРОБРОСА ПОРТА ===\e[0m"
-           
-           if [ ! -f "$UP_SCRIPT" ] || ! grep -q "DNAT" "$UP_SCRIPT"; then
-               echo -e "\e[1;30mСписок проброшенных портов пуст.\e[0m"
-               read -p "Enter..." temp; continue
-           fi
+        4)
+            echo -e "\n\e[1;34m=== ❌ УДАЛЕНИЕ ПРОБРОСА ПОРТА ===\e[0m"
 
-           echo "Текущие правила:"
-           grep "DNAT" "$UP_SCRIPT" | awk -F'--dport ' '{print $2}' | awk '{print "ID: " NR " | Порт: " $1}'
-           
-           read -p "Введите НОМЕР ПОРТА для удаления: " D_PORT
-           [ -z "$D_PORT" ] && continue
+            if [ ! -f "$UP_SCRIPT" ] || ! grep -q "DNAT" "$UP_SCRIPT"; then
+                echo -e "\e[1;30mСписок проброшенных портов пуст.\e[0m"
+                read -p "Enter..." temp; continue
+            fi
 
-           if grep -q "dport $D_PORT " "$UP_SCRIPT"; then
-               echo -e "♻️ Удаляю правила для порта $D_PORT..."
-               
-               sed -i "/--dport $D_PORT /d" "$UP_SCRIPT"
-               
-               sed -i "/PORT_$D_PORT/d" "$UP_SCRIPT"
-               
-               ufw delete allow "$D_PORT" >/dev/null 2>&1
+            echo "Текущие правила:"
+            grep "DNAT" "$UP_SCRIPT" | awk -F'--dport ' '{print $2}' | awk '{print "ID: " NR " | Порт: " $1}'
 
-               echo -e "✅ Порт $D_PORT успешно удален из системы."
-               
-               systemctl restart wg-quick@wg0
-           else
-               echo -e "\e[1;31m❌ Ошибка: Порт $D_PORT не найден в списке активных правил!\e[0m"
-           fi
-           read -p "Enter..." temp ;;
-        5) 
-           echo -e "\n\e[1;34m=== 👥 ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯ (SMART) ===\e[0m"
-           read -p "Введите имя (Латиница): " RAW_NAME
-           
-           NEW_NAME=$(echo "$RAW_NAME" | tr -cd 'a-zA-Z0-9_-')
-           [ -z "$NEW_NAME" ] && { echo "❌ Имя не может быть пустым!"; read -p "Enter..." temp; continue; }
+            read -p "Введите НОМЕР ПОРТА для удаления: " D_PORT
+            [ -z "$D_PORT" ] && continue
 
-           if grep -q "# Client: $NEW_NAME" "$WG_CONF"; then
-               echo "❌ Такое имя уже есть!"; read -p "Enter..." temp; continue
-           fi
-           WG_BASE=$(grep "^Address" "$WG_CONF" | head -1 | awk '{print $3}' | cut -d/ -f1 | cut -d. -f1-3) 
-           LAST_OCTET=$(grep "AllowedIPs" "$WG_CONF" | grep -oP "$WG_BASE\.\d+" | cut -d. -f4 | sort -rn | head -1)
-           NEW_IP="$WG_BASE.$(( ${LAST_OCTET:-2} + 1 ))"
+            if grep -q "dport $D_PORT " "$UP_SCRIPT"; then
+                echo -e "♻️ Удаляю правила для порта $D_PORT..."
+                sed -i "/--dport $D_PORT /d" "$UP_SCRIPT"
+                sed -i "/PORT_$D_PORT/d" "$UP_SCRIPT"
+                ufw delete allow "$D_PORT" >/dev/null 2>&1
 
-           CURRENT_DNS=$(grep "DNS =" "$CLIENT_DIR/Router.conf" 2>/dev/null | awk '{print $3}')
-           CURRENT_DNS=${CURRENT_DNS:-8.8.8.8}
+                echo -e "✅ Порт $D_PORT успешно удален из системы."
+                systemctl restart wg-quick@wg0
+            else
+                echo -e "\e[1;31m❌ Ошибка: Порт $D_PORT не найден в списке активных правил!\e[0m"
+            fi
+            read -p "Enter..." temp ;;
+        5)
+            echo -e "\n\e[1;34m=== 👥 ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯ (SMART) ===\e[0m"
+            read -p "Введите имя (Латиница): " RAW_NAME
 
-           echo "Создаем $NEW_NAME ($NEW_IP) [DNS: $CURRENT_DNS]..."
-           
-           SRV_PUB=$(grep "PrivateKey" "$WG_CONF" | awk '{print $3}' | wg pubkey)
-           [ -z "$SRV_PUB" ] && SRV_PUB=$(wg show wg0 public-key 2>/dev/null)
+            NEW_NAME=$(echo "$RAW_NAME" | tr -cd 'a-zA-Z0-9_-')
+            [ -z "$NEW_NAME" ] && { echo "❌ Имя не может быть пустым!"; read -p "Enter..." temp; continue; }
 
-           generate_peer_config "$NEW_NAME" "$NEW_IP" "$CURRENT_DNS" "$SRV_PUB" "false"
-           
-           echo "✅ Создано. QR-код:"
-           if [ -f "$CLIENT_DIR/$NEW_NAME.conf" ]; then
-               qrencode -t ansiutf8 < "$CLIENT_DIR/$NEW_NAME.conf" 2>/dev/null
-           else
-               echo "⚠️ Ошибка: файл конфига не создан."
-           fi
-           
-           systemctl restart wg-quick@wg0
-           read -p "Enter..." temp ;;
-        6) 
-           echo -e "\n\e[1;34m=== 🗑️ УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ (SMART) ===\e[0m"
-           declare -a names_list; declare -A clients_ips; i=0; current_name=""
-           echo "Список пользователей:"
-           while read -r line; do
-               line=$(echo "$line" | xargs)
-               if [[ "$line" =~ ^#\ Client:\ (.*) ]]; then
-                   current_name="${BASH_REMATCH[1]}"
-               elif [[ "$line" =~ ^AllowedIPs\ =\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                   if [ -n "$current_name" ]; then
-                       ip="${BASH_REMATCH[1]}"
-                       names_list[$i]="$current_name"
-                       clients_ips["$current_name"]="$ip"
-                       echo -e "$i) 👤 \e[1;32m$current_name\e[0m ($ip)"
-                       i=$((i + 1))
-                       current_name=""
-                   fi
-               fi
-           done < "$WG_CONF"
+            if grep -q "# Client: $NEW_NAME" "$WG_CONF"; then
+                echo "❌ Такое имя уже есть!"; read -p "Enter..." temp; continue
+            fi
+            WG_BASE=$(grep "^Address" "$WG_CONF" | head -1 | awk '{print $3}' | cut -d/ -f1 | cut -d. -f1-3)
+            LAST_OCTET=$(grep "AllowedIPs" "$WG_CONF" | grep -oP "$WG_BASE\.\d+" | cut -d. -f4 | sort -rn | head -1)
+            NEW_IP="$WG_BASE.$(( ${LAST_OCTET:-2} + 1 ))"
 
-           [ "$i" -eq 0 ] && { echo "Список пуст."; read -p "Enter..." temp; continue; }
+            CURRENT_DNS=$(grep "DNS =" "$CLIENT_DIR/Router.conf" 2>/dev/null | awk '{print $3}')
+            CURRENT_DNS=${CURRENT_DNS:-8.8.8.8}
 
-           read -p "Введите НОМЕР для удаления: " USER_NUM
-           if [[ "$USER_NUM" =~ ^[0-9]+$ ]] && [ "$USER_NUM" -lt "$i" ]; then
-               DEL_NAME="${names_list[$USER_NUM]}"
-               DEL_IP="${clients_ips[$DEL_NAME]}"
+            echo "Создаем $NEW_NAME ($NEW_IP) [DNS: $CURRENT_DNS]..."
 
-               echo -e "♻️ Удаление $DEL_NAME и очистка ресурсов..."
+            SRV_PUB=$(grep "PrivateKey" "$WG_CONF" | awk '{print $3}' | wg pubkey)
+            [ -z "$SRV_PUB" ] && SRV_PUB=$(wg show wg0 public-key 2>/dev/null)
 
-               if [ -f "$UP_SCRIPT" ]; then
-                   PORTS_TO_CLOSE=$(grep "to-destination $DEL_IP" "$UP_SCRIPT" | grep -oP '(?<=dport )\d+' | sort -u)
-                   
-                   for port in $PORTS_TO_CLOSE; do
-                       echo "   -> Закрываю порт $port в UFW..."
-                       ufw delete allow "$port" >/dev/null 2>&1
-                       ufw delete allow "$port/tcp" >/dev/null 2>&1
-                       ufw delete allow "$port/udp" >/dev/null 2>&1
-                       sed -i "/PORT_$port/d" "$UP_SCRIPT"
-                   done
+            generate_peer_config "$NEW_NAME" "$NEW_IP" "$CURRENT_DNS" "$SRV_PUB" "false"
 
-                   sed -i "/$DEL_IP/d" "$UP_SCRIPT"
-                   sed -i "/# Client:$DEL_NAME/d" "$UP_SCRIPT"
-               fi
+            echo "✅ Создано. QR-код:"
+            if [ -f "$CLIENT_DIR/$NEW_NAME.conf" ]; then
+                qrencode -t ansiutf8 < "$CLIENT_DIR/$NEW_NAME.conf" 2>/dev/null
+            else
+                echo "⚠️ Ошибка: файл конфига не создан."
+            fi
 
-               LINE=$(grep -n "# Client: $DEL_NAME" "$WG_CONF" | cut -d: -f1)
-               if [ -n "$LINE" ]; then
-                   START=$LINE
-                   END=$((LINE + 3))
-                   sed -i "${START},${END}d" "$WG_CONF"
-                   
-                   sed -i '/^$/N;/^\n$/D' "$WG_CONF"
-                   
-                   rm -f "$CLIENT_DIR/$DEL_NAME.conf"
-                   echo "✅ Пользователь $DEL_NAME и все его порты удалены."
-                   systemctl restart wg-quick@wg0
-               fi
-           else
-               echo "❌ Неверный номер!"
-           fi
-           read -p "Enter..." temp ;;
-        7) 
-           echo -e "\n\e[1;34m=== 🏎️ ИЗМЕНЕНИЕ ЛИМИТА СКОРОСТИ ===\e[0m"
-           [ ! -f "$WG_CONF" ] && { echo "Файл конфига не найден!"; read -p "Enter..." temp; continue; }
+            reload_wg_peers
+            read -p "Enter..." temp ;;
+        6)
+            echo -e "\n\e[1;34m=== 🗑️ УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ (SMART) ===\e[0m"
+            declare -a names_list; declare -A clients_ips; i=0; current_name=""
+            echo "Список пользователей:"
+            while read -r line; do
+                line=$(echo "$line" | xargs)
+                if [[ "$line" =~ ^#\ Client:\ (.*) ]]; then
+                    current_name="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^AllowedIPs\ =\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                    if [ -n "$current_name" ]; then
+                        ip="${BASH_REMATCH[1]}"
+                        names_list[$i]="$current_name"
+                        clients_ips["$current_name"]="$ip"
+                        echo -e "$i) 👤 \e[1;32m$current_name\e[0m ($ip)"
+                        i=$((i + 1))
+                        current_name=""
+                    fi
+                fi
+            done < "$WG_CONF"
 
-           declare -a names_list
-           declare -A clients_ips
-           i=0
-           current_name=""
+            [ "$i" -eq 0 ] && { echo "Список пуст."; read -p "Enter..." temp; continue; }
 
-           echo "Список пользователей:"
-           while read -r line; do
-               line=$(echo "$line" | xargs)
-               if [[ "$line" =~ ^#\ Client:\ (.*) ]]; then
-                   current_name="${BASH_REMATCH[1]}"
-               elif [[ "$line" =~ ^AllowedIPs\ =\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                   if [ -n "$current_name" ]; then
-                       ip="${BASH_REMATCH[1]}"
-                       names_list[$i]="$current_name"
-                       clients_ips["$current_name"]="$ip"
-                       
-                       CURRENT_LIMIT=$(grep -a "# Client:$current_name" "$UP_SCRIPT" 2>/dev/null | grep "rate" | head -1 | awk -F'rate ' '{print $2}' | awk '{print $1}')
-                       [ -z "$CURRENT_LIMIT" ] && lim_info="\e[1;30m♾️ Unlim\e[0m" || lim_info="\e[1;33m📉 ${CURRENT_LIMIT}Mb\e[0m"
+            read -p "Введите НОМЕР для удаления: " USER_NUM
+            if [[ "$USER_NUM" =~ ^[0-9]+$ ]] && [ "$USER_NUM" -lt "$i" ]; then
+                DEL_NAME="${names_list[$USER_NUM]}"
+                DEL_IP="${clients_ips[$DEL_NAME]}"
 
-                       echo -e "$i) 👤 \e[1;32m$current_name\e[0m ($ip) [ $lim_info ]"
-                       i=$((i + 1))
-                       current_name=""
-                   fi
-               fi
-           done < "$WG_CONF"
+                echo -e "♻️ Удаление $DEL_NAME и очистка ресурсов..."
 
-           if [ "$i" -eq 0 ]; then echo "Список пуст."; read -p "Enter..." temp; continue; fi
+                PORTS_REMOVED=0
+                if [ -f "$UP_SCRIPT" ]; then
+                    PORTS_TO_CLOSE=$(grep "to-destination $DEL_IP" "$UP_SCRIPT" | grep -oP '(?<=dport )\d+' | sort -u)
 
-           echo "----------------------------------------------"
-           read -p "Выберите НОМЕР клиента: " USER_NUM
+                    for port in $PORTS_TO_CLOSE; do
+                        echo "   -> Закрываю порт $port в UFW..."
+                        ufw delete allow "$port" >/dev/null 2>&1
+                        ufw delete allow "$port/tcp" >/dev/null 2>&1
+                        ufw delete allow "$port/udp" >/dev/null 2>&1
+                        sed -i "/PORT_$port/d" "$UP_SCRIPT"
+                        PORTS_REMOVED=1
+                    done
 
-           if [[ "$USER_NUM" =~ ^[0-9]+$ ]] && [ "$USER_NUM" -lt "$i" ]; then
-               C_NAME="${names_list[$USER_NUM]}"
-               C_IP="${clients_ips[$C_NAME]}"
+                    sed -i "/$DEL_IP/d" "$UP_SCRIPT"
+                    sed -i "/# Client:$DEL_NAME/d" "$UP_SCRIPT"
+                fi
 
-               read -p "Новый лимит для $C_NAME (Мбит/с, 0 - безлимит): " NEW_S
-               
-               sed -i "/# Client:$C_NAME/d" "$UP_SCRIPT"
-               
-               if [ "$NEW_S" -ne 0 ] 2>/dev/null; then
-                   apply_mirror_limit "$C_NAME" "$C_IP" "$NEW_S"
-                   echo "✅ Лимит ${NEW_S}Mb установлен для $C_NAME."
-               else
-                   echo "♾️ Ограничения для $C_NAME сняты."
-               fi
+                LINE=$(grep -n "# Client: $DEL_NAME" "$WG_CONF" | cut -d: -f1)
+                if [ -n "$LINE" ]; then
+                    START=$LINE
+                    END=$((LINE + 3))
+                    sed -i "${START},${END}d" "$WG_CONF"
+                    sed -i '/^$/N;/^\n$/D' "$WG_CONF"
 
-               systemctl restart wg-quick@wg0
-           else
-               echo "❌ Неверный номер!"
-           fi
-           read -p "Enter..." temp ;;
-         8) show_tech_menu ;;
-		 9) manage_bot ;;
+                    rm -f "$CLIENT_DIR/$DEL_NAME.conf"
+                    echo "✅ Пользователь $DEL_NAME и все его порты удалены."
+                    if [ "$PORTS_REMOVED" -eq 1 ]; then
+                        systemctl restart wg-quick@wg0
+                    else
+                        reload_wg_peers
+                    fi
+                fi
+            else
+                echo "❌ Неверный номер!"
+            fi
+            read -p "Enter..." temp ;;
+        7)
+            echo -e "\n\e[1;34m=== 🏎️ ИЗМЕНЕНИЕ ЛИМИТА СКОРОСТИ ===\e[0m"
+            [ ! -f "$WG_CONF" ] && { echo "Файл конфига не найден!"; read -p "Enter..." temp; continue; }
+
+            declare -a names_list
+            declare -A clients_ips
+            i=0
+            current_name=""
+
+            echo "Список пользователей:"
+            while read -r line; do
+                line=$(echo "$line" | xargs)
+                if [[ "$line" =~ ^#\ Client:\ (.*) ]]; then
+                    current_name="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^AllowedIPs\ =\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                    if [ -n "$current_name" ]; then
+                        ip="${BASH_REMATCH[1]}"
+                        names_list[$i]="$current_name"
+                        clients_ips["$current_name"]="$ip"
+
+                        CURRENT_LIMIT=$(grep -a "# Client:$current_name" "$UP_SCRIPT" 2>/dev/null | grep "rate" | head -1 | awk -F'rate ' '{print $2}' | awk '{print $1}')
+                        [ -z "$CURRENT_LIMIT" ] && lim_info="\e[1;30m♾️ Unlim\e[0m" || lim_info="\e[1;33m📉 ${CURRENT_LIMIT}Mb\e[0m"
+
+                        echo -e "$i) 👤 \e[1;32m$current_name\e[0m ($ip) [ $lim_info ]"
+                        i=$((i + 1))
+                        current_name=""
+                    fi
+                fi
+            done < "$WG_CONF"
+
+            if [ "$i" -eq 0 ]; then echo "Список пуст."; read -p "Enter..." temp; continue; fi
+
+            echo "----------------------------------------------"
+            read -p "Выберите НОМЕР клиента: " USER_NUM
+
+            if [[ "$USER_NUM" =~ ^[0-9]+$ ]] && [ "$USER_NUM" -lt "$i" ]; then
+                C_NAME="${names_list[$USER_NUM]}"
+                C_IP="${clients_ips[$C_NAME]}"
+
+                read -p "Новый лимит для $C_NAME (Мбит/с, 0 - безлимит): " NEW_S
+
+                sed -i "/# Client:$C_NAME/d" "$UP_SCRIPT"
+
+                if [ "$NEW_S" -ne 0 ] 2>/dev/null; then
+                    apply_mirror_limit "$C_NAME" "$C_IP" "$NEW_S"
+                    echo "✅ Лимит ${NEW_S}Mb установлен для $C_NAME."
+                else
+                    apply_mirror_limit "$C_NAME" "$C_IP" "0"
+                    echo "♾️ Ограничения для $C_NAME сняты."
+                fi
+            else
+                echo "❌ Неверный номер!"
+            fi
+            read -p "Enter..." temp ;;
+        8) show_tech_menu ;;
+        9) manage_bot ;;
         0) exit 0 ;;
     esac
- done
+done
