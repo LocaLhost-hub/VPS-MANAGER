@@ -172,7 +172,12 @@ manage_security() {
         LAST_UP=$(tail -n 1 /var/log/vps_geoip.log 2>/dev/null | cut -d: -f1-2)
         [ -z "$LAST_UP" ] && LAST_UP="Никогда"
         CRON_ST=$(crontab -l 2>/dev/null | grep -q "update_geoip" && echo -e "\e[1;32mВКЛ\e[0m" || echo -e "\e[1;31mВЫКЛ\e[0m")
-
+CRON_ST=$(crontab -l 2>/dev/null | grep -q "update_geoip" && echo -e "\e[1;32mВКЛ\e[0m" || echo -e "\e[1;31mВЫКЛ\e[0m")
+        if grep -qE "^iptables.*-A POSTROUTING.*-o wg0 -j MASQUERADE" "$UP_SCRIPT" 2>/dev/null; then
+            REAL_IP_ST="\e[1;31mВЫКЛ (NAT)\e[0m"
+        else
+            REAL_IP_ST="\e[1;32mВКЛ\e[0m"
+        fi
         echo -e "=== 🔐 ЦЕНТР БЕЗОПАСНОСТИ ==="
         echo "1) 🔑 Переключить SSH пароль (Вкл/Выкл)"
         echo "2) 🚀 Изменить SSH порт"
@@ -183,6 +188,7 @@ manage_security() {
         echo -e "7) \e[1;32m🔑 УПРАВЛЕНИЕ SSH КЛЮЧАМИ\e[0m"
         echo -e "8) 🔄 Автообновление GeoIP [ $CRON_ST ] | Last: \e[1;33m$LAST_UP\e[0m"
 		echo "9) 🚑 Разбанить IP"
+		echo -e "10) 🌐 Реальные IP клиентов [ $REAL_IP_ST ]"
         echo "0) 🔙 Назад"
         read -p "Выбор: " S_OPT
         
@@ -374,6 +380,22 @@ EOF
                    fi
                fi
                ;;
+			   10)
+               if [ ! -f "$UP_SCRIPT" ]; then
+                   echo "❌ Файл $UP_SCRIPT не найден! Сначала выполните установку."
+               elif grep -qE "^iptables.*-A POSTROUTING.*-o wg0 -j MASQUERADE" "$UP_SCRIPT"; then
+                   sed -i '/-A POSTROUTING.*-o wg0 -j MASQUERADE/d' "$UP_SCRIPT"
+                   systemctl restart wg-quick@wg0
+                   echo -e "✅ Реальные IP \e[1;32mВКЛЮЧЕНЫ\e[0m (MASQUERADE на wg0 удален)."
+               else
+                   sed -i '/^exit 0/d' "$UP_SCRIPT"
+                   echo "iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE" >> "$UP_SCRIPT"
+                   echo "exit 0" >> "$UP_SCRIPT"
+                   systemctl restart wg-quick@wg0
+                   echo -e "⚠️ Реальные IP \e[1;31mВЫКЛЮЧЕНЫ\e[0m (включен MASQUERADE на wg0)."
+               fi
+               ;;
+            0) return ;;
             0) return ;;
         esac
         read -p "Enter..." temp
